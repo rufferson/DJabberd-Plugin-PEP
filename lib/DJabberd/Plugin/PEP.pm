@@ -153,14 +153,11 @@ sub handle_presence {
 	    } else {
 		$self->set_sub($jid);
 	    }
-	    # and subscribe now to all active PEP nodes according to roster/caps if the account is local (we have it's roster)
-	    $self->subscribe($jid) if($self->vh->handles_jid($jid));
+	    # and subscribe now to all active PEP nodes according to caps and active publishers
+	    $self->subscribe($jid);
 	}
     } elsif($type eq 'unavailable') {
-	$self->cleanup($jid);
-    # We really need to do this on roster update, otherswise we'll merely start pushing to bare jid.
-    #} elsif($type eq 'unsubscribe' && $pres->from_jid) {
-    #	$self->unsub($pres->from_jid->as_bare_string,$pres->to_jid->as_bare_string);
+	$self->del_subpub($jid);
     }
 }
 sub disco_bare_info {
@@ -229,7 +226,7 @@ sub disco_bare_jid {
 	if(!$self->get_sub($from,$node)) {
 	    $self->set_sub($from,$node,map{$_->bare}$cap->get('feature'));
 	    $logger->debug("Pending caps received, making subscription for ".$from->as_string);
-	    $self->subscribe($from,$node) if($self->vh->handles_jid($from));
+	    $self->subscribe($from);
 	}
 	return 1;
     }
