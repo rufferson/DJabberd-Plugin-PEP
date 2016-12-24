@@ -92,9 +92,11 @@ sub register {
 	$cb->decline;
     };
     my $cleanup_cb = sub {
-	my ($vh, $cb, $conn) = @_;
-	if($conn && $conn->isa('DJabberd::Connection::ClientIn') && $conn->bound_jid) {
-	    $self->cleanup($conn->bound_jid);
+	my ($vh, $cb, $c) = @_;
+	if($c && $c->isa('DJabberd::Connection::ClientIn') && $c->bound_jid) {
+	    $self->del_subpub($c->bound_jid);
+	} elsif($c && $c->isa('DJabberd::Presence') && $c->from && !$c->from_jid->is_bare) {
+	    $self->del_subpub($c->from_jid);
 	}
 	$cb->decline;
     };
@@ -114,14 +116,6 @@ sub vh {
     return $_[0]->{vhost};
 }
 
-sub cleanup {
-    my $self = shift;
-    my $jid = shift;
-    # Wait, there could be more resources publishing. Let's remove the nodes explicitly only
-    #delete $self->{pub}->{$conn->bound_jid->as_bare_string};
-    # But subscriptions is something we can really remove
-    delete $self->{sub}->{$jid->as_bare_string};
-}
 sub handle_presence {
     my $self = shift;
     my $pres = shift;
@@ -643,7 +637,14 @@ sub get_pub_nodes {
     return () unless($pub && ref($pub) eq 'HASH');
     return grep{$_ ne 'last'} keys(%{$pub});
 }
-
+sub get_sub_nodes {
+    my $self = shift;
+    my $user = shift;
+    return undef unless($user && ref($user) && UNIVERSAL::isa($user,'DJabberd::JID'));
+    my $sub = $self->get_sub($user);
+    return undef unless($sub && ref($sub) eq 'HASH');
+    return @{$sub->{topics}};
+}
 =head2 get_sub($self,$user,$node)
 =cut
 =head2 set_sub($self,$user,$node,(@list))
@@ -718,6 +719,33 @@ sub set_subpub {
     $self->{sub}->{$bsub} = { pub => {} } unless(ref($self->{sub}->{$bsub}) eq 'HASH');
     return $self->{sub}->{$bsub}->{pub}->{$bpub} = 1 if(!@_ or $_[0]); # implicit or explicit set
     return delete $self->{sub}->{$bsub}->{pub}->{$bpub}; # this was a removal call
+}
+
+=head2 del_pubsub()
+
+The call intended to clean up the mess after previous two.
+
+Actually it tries to remove all bi-directional references between publisher and subscriber but only to remove
+explicit full jid subscription without touching global state. In other words - to reverse explicit subscription
+relationship built on presence/caps reception. Hence it should be used in unavailable presence handler.
+=cut
+
+sub del_subpub {
+    my $self = shift;
+    my $user = shift;
+    return unless($user && ref($user) && !$user->is_bare);
+    foreach my$p(keys(%{$self->{sub}->{$user->as_bare_string}->{pub}})) {
+	my @nodes;
+	if($self->{sub}->{$user->as_bare_string}->{$user->as_string}->{node}) {
+	    @nodes = $self->get_sub_nodes($user);
+	} else {
+	    @nodes = $self->get_pub_nodes($p);
+	}
+	foreach my$n(@nodes) {
+	    delete $self->{pub}->{$n}->{$user->as_bare_jid}->{$user->as_string}
+	}
+    }
+    delete $self->{sub}->{$user->as_bare_string}->{$user->as_string};
 }
 =head1 INTERNALS
 =cut
