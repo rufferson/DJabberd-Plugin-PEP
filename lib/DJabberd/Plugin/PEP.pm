@@ -195,7 +195,6 @@ sub disco_bare_jid {
     my $from = shift;
     # if request goes to explicit bare jid of the local user
     if($iq->to && $iq->to_jid->is_bare && $iq->to ne $self->vh->name && $self->vh->handles_jid($iq->to_jid)) {
-	$logger->debug("Our Pezdyuk: ".$iq->as_xml." from ".$from->as_string);
 	# Handle explicit discovery of the user's bare jid - represent the user with PEP node.
 	if($iq->signature eq 'get-{http://jabber.org/protocol/disco#info}query' or $iq->signature eq 'get-{http://jabber.org/protocol/disco#items}query') {
 	    my @stuffing;
@@ -219,12 +218,10 @@ sub disco_bare_jid {
 	    }
 	}
     } elsif((!$iq->to || $iq->to eq $self->vh->name) && $iq->signature eq 'result-{http://jabber.org/protocol/disco#info}query') {
-	$logger->debug("Our Pezdyuk: ".join(', ',%{$iq->first_element->attrs}));
 	# This might be responce to our discovery.
 	my $node = $iq->first_element->attr('{}node') || "";
 	return 0 unless($node); # It wasn't a reply to our request after all, we're always asking for node
 	my $caps = $self->get_cap($node);
-	$logger->debug("Pezdyuk has node $node");
 	return 0 unless($caps && !ref($caps)); # The node is set but we don't have it cached. Must be not ours either
 	$logger->info("Got disco result for ".$node." from ".$iq->from);
 	my $cap = DJabberd::Caps->new($iq->first_element->children);
