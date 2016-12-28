@@ -101,10 +101,15 @@ sub register {
 	$cb->decline;
     };
     $self->{vhost} = $vhost;
+    # Publisher/Owner could only be C2S. It also needs to catch presence and disco.
     $vhost->register_hook("switch_incoming_client",$manage_cb);
+    # S2S is mainly for presence handler, also disco and bounce
     $vhost->register_hook("switch_incoming_server",$handle_cb);
+    # Below two should clean up presence cache.
     $vhost->register_hook("ConnectionClosing",$cleanup_cb);
     $vhost->register_hook("AlterPresenceUnavailable",$cleanup_cb);
+    # Roster hook should track subscription to presence to forcibely unsubscribe contact
+    # TODO on update/delete hooks doing cleanup. Althoug presence should suffice.
     $vhost->caps->add(DJabberd::Caps::Identity->new("pubsub","pep","djabberd"));
     foreach my $psf(@pubsub_features) {
 	$vhost->caps->add(DJabberd::Caps::Feature->new(PUBSUBNS.'#'.$psf));
@@ -135,7 +140,7 @@ sub handle_presence {
 		# The presence came to our account, so we need to know its filters even if we have no publishers at the moment
 		if(!$cap or !exists $cap->{caps}) {
 		    $self->set_cap($nver,$hash);
-		    my $iq = DJabberd::IQ->new({from=>$self->vh->name,to=>$jid->as_string,type=>'get'},[
+		    my $iq = DJabberd::IQ->new('','iq',{from=>$self->vh->name,to=>$jid->as_string,type=>'get'},[
 			DJabberd::XMLElement->new('','query',{ xmlns=>'http://jabber.org/protocol/disco#info', node=>$nver },[])
 		    ]);
 		    $iq->set_attr('{}id','pep-iq-'.$self->{id}++);
@@ -223,7 +228,7 @@ sub disco_bare_jid {
 	    $node = "$nuri#$capdgst";
 	    $self->set_cap($nuri,$capdgst,$cap);
 	}
-	if(!$self->get_sub($from,$node)) {
+	if(!$self->get_sub($from)) {
 	    $self->set_sub($from,$node,map{$_->bare}$cap->get('feature'));
 	    $logger->debug("Pending caps received, making subscription for ".$from->as_string);
 	    $self->subscribe($from);
@@ -339,7 +344,7 @@ sub publish {
     my $user = shift;
     my $node = shift;
     my $item = shift;
-    my $event = DJabberd::Message->new({'{}from'=>$user->as_bare_string, '{}type'=>'headline'}, [
+    my $event = DJabberd::Message->new('','message',{'{}from'=>$user->as_bare_string, '{}type'=>'headline'}, [
 	DJabberd::XMLElement->new('','addresses',{xmlns=>'http://jabber.org/protocol/address'},[
 		DJabberd::XMLElement->new('','address',{type=>'replyto', jid => $user->as_string},[])
 	]),
@@ -368,7 +373,7 @@ sub publish {
     # Then try to figure something from Roster and Subs
     $self->vh->get_roster($user,on_success=>sub {
 	my $roster = shift;
-	foreach my$ri($roster->to_items) {
+	foreach my$ri($roster->from_items) {
 	    # check and skip if we have explicit full subsriptions for this bare as [XEP-0163 4.3.2] orders
 	    my $ps = $self->get_pub($user,$node,$ri->jid->as_bare_string);
 	    next if($ps && ref($ps) eq 'HASH' && values(%{$ps}));
@@ -397,6 +402,8 @@ sub publish {
 		    next;
 		}
 	    }
+	    # If we have no presence cache - we're likely starting up, let's skip flooding till we get one
+	    next unless($self->get_sub);
 	    # No presence knowledge, push to the bare
 	    $self->emit($event,$ri->jid->as_bare_string);
 	}
@@ -470,7 +477,7 @@ sub subscribe {
     return unless(@pubs); # no one is publishing to the user. TODO: explicit won't work here
     my $sub = $self->get_sub($user);
     return if($sub && $sub->{node} && !@{$sub->{topics}}); # We don't need no notifications
-    my @topics = (${$sub && $sub->{topics} || []});
+    my @topics = @{$sub->{topics}} if($sub && ref($sub) eq 'HASH' && ref($sub->{topics}) eq 'ARRAY');
     $logger->debug("User ".$user->as_string." doesn't mind getting PEP events: ".(@topics ? join(', ',@topics):'all'));
     foreach my$bpub(@pubs) {
 	unless($self->get_pub($bpub)) {
@@ -642,27 +649,34 @@ sub get_sub_nodes {
     return undef unless($sub && ref($sub) eq 'HASH');
     return @{$sub->{topics}};
 }
-=head2 get_sub($self,$user,$node)
+=head2 get_sub($self,$user)
 =cut
 =head2 set_sub($self,$user,$node,(@list))
 
-These calls are used to manage subscriber's state. Subscriber's state is a hint, it's not used actively during delivery.
-The state is set when user sends available presence(goes online) with entity caps visible on PEP service.
+These calls are used to manage subscriber's state.
 
-PEP then resolves caps figuring C<+notify> topics and sets them in subscription state. If later publisher goes online
-it will use the pre-set hints for C<filtered-notifications> pubsub feature. Presence without notifications will still
-register an entry in sub table, but empty caps entry means catch-all or follow-the-presence.
+Subscriber's state is a hint, it's not used actively during delivery.  The state
+is set when user sends available presence(goes online) with entity caps visible
+on PEP service.
 
-The @list argument is representing list of features discovered from the client (disco#info result's var list) - from
-DJabberd::Caps object received from get_cap call.
+PEP then resolves caps figuring C<+notify> topics and sets them in subscription
+state. If later publisher goes online it will use the pre-set hints for
+C<filtered-notifications> pubsub feature. Presence without notifications will
+still register an entry in sub table, but empty caps entry means catch-all or
+follow-the-presence.
 
+The @list argument is representing list of features discovered from the client
+(disco#info result's var list) - from DJabberd::Caps object received from
+get_cap call.
+
+When get_sub is called with no arguments - it returns all second level keys
+representing full jids of contacts with known presence.
 =cut
 
 sub get_sub {
     my $self = shift;
     my $user = shift;
-    my $node = shift;
-    return undef unless($user);
+    return grep{$_ ne 'pub'}map{keys(%{$_})}values(%{$self->{sub}}) unless($user);
     return $self->{sub}->{$user} unless(ref($user)); # bare jid string
     return $self->{sub}->{$user->as_bare_string}->{$user->as_string};
 }
@@ -739,7 +753,7 @@ sub del_subpub {
 	    @nodes = $self->get_pub_nodes($p);
 	}
 	foreach my$n(@nodes) {
-	    delete $self->{pub}->{$n}->{$user->as_bare_jid}->{$user->as_string}
+	    delete $self->{pub}->{$n}->{$user->as_bare_string}->{$user->as_string}
 	}
     }
     delete $self->{sub}->{$user->as_bare_string}->{$user->as_string};
