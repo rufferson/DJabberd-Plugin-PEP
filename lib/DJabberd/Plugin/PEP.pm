@@ -55,21 +55,20 @@ my @pubsub_features = (
 sub register {
     my ($self,$vhost) = @_;
     my $manage_cb = sub {
-	my ($vh, $cb, $iq) = @_;
+	my ($vh, $cb, $iq, $c) = @_;
 	if($iq->isa("DJabberd::IQ")) {
-	    if(!$iq->to || $iq->to eq $iq->from || $iq->to eq $vh->name) {
-		if ($iq->signature eq 'get-{'.PUBSUBNS.'}pubsub') {
-		    $logger->debug("PEP Query: ".$iq->as_xml);
-		    $self->get_pep($iq);
-		    $cb->stop_chain;
-		    return;
-		} elsif ($iq->signature eq 'set-{'.PUBSUBNS.'}pubsub') {
-		    $logger->debug("PEP Modify: ".$iq->as_xml);
-		    $self->set_pep($iq);
-		    $cb->stop_chain;
-		    return;
-		}
+	    if((!$iq->to || $iq->to eq $iq->from || $iq->to eq $vh->name) && $iq->signature eq 'set-{'.PUBSUBNS.'}pubsub') {
+		# This is only for direct c2s
+		$logger->debug("PEP Modify: ".$iq->as_xml);
+		$self->set_pep($iq);
+		$cb->stop_chain;
+		return;
 	    } elsif($self->disco_bare_jid($iq,$iq->connection->bound_jid)) {
+		$cb->stop_chain;
+		return;
+	    } elsif ($iq->to && $vh->handles_jid($iq->to_jid) && $iq->signature eq 'get-{'.PUBSUBNS.'}pubsub') {
+		$logger->debug("PEP Query: ".$iq->as_xml);
+		$self->get_pep($iq,$iq->connection->bound_jid);
 		$cb->stop_chain;
 		return;
 	    }
@@ -81,8 +80,14 @@ sub register {
     };
     my $handle_cb = sub {
 	my ($vh, $cb, $iq) = @_;
-	if($iq->isa("DJabberd::IQ") && $iq->to && $iq->from && $self->disco_bare_jid($iq,$iq->connection->bound_jid)) {
-	    $cb->stop_chain;
+	if($iq->isa("DJabberd::IQ") && $iq->to && $iq->from) {
+	    if($self->disco_bare_jid($iq,$iq->connection->bound_jid)) {
+		return $cb->stop_chain;
+	    } elsif ($vh->handles_jid($iq->to_jid) && $iq->signature eq 'get-{'.PUBSUBNS.'}pubsub') {
+		$logger->debug("PEP Query: ".$iq->as_xml);
+		$self->get_pep($iq,$iq->from_jid);
+		return $cb->stop_chain;
+	    }
 	} elsif($iq->isa("DJabberd::Presence")) {
 	    # Presence registration/check
 	    $self->handle_presence($iq);
@@ -238,6 +243,27 @@ sub disco_bare_jid {
     return 0;
 }
 
+=head2 set_pep($self,$iq)
+=cut
+=head2 get_pep($self,$iq,$from)
+
+The methods are used to publish (set) or retrieve (get) pubsub items.
+
+The method is called as a handler for corresponding IQ of type get or set with
+pubsub{xmlns}/items{node}/item{id}/... child elements.
+
+Set is called only on c2s connection when client speaks directly to server (no
+to or to equal to server jid). It extracts published item and calls L<publish>
+method to actually publish the payload.
+
+Get is called for both c2s and s2s connection handlers but it checks permission
+which is granted by implicit or explicit subscription state.
+
+Get does not extract C<from> attribute from IQ Stanza, rather it requires caller
+to supply what it considers as a trusted C<< from >> Djabberd::JID object.
+
+=cut
+
 sub set_pep {
     my $self = shift;
     my $iq = shift;
@@ -255,7 +281,32 @@ sub set_pep {
 sub get_pep {
     my $self = shift;
     my $iq = shift;
-    $logger->error("GET PEP ".$iq->as_xml);
+    my $from = shift;
+    my $what = $iq->first_element->first_element;
+    if($what && $what->element_name eq 'items' && $what->attr('{}node')) {
+	my $node = $what->attr('{}node');
+	unless($from->as_bare_string eq $iq->to_jid->as_bare_string or $self->get_pub($iq->to_jid,$node,$from->as_bare_string)) {
+	    # We have neither explicit subscription, nor implied subscription need to check roster
+	    # TODO
+	    my $err = $iq->make_error_response(403,'auth','not-authorized');
+	    return $err->deliver($self->vh);
+	}
+	my $event = $self->get_pub_last($iq->to_jid,$node);
+	my $res = $iq->clone;
+	$res->set_to($iq->from_jid);
+	$res->set_from($iq->to_jid);
+	$res->set_attr('{}type','result');
+	my @items = grep {$_->element_name eq 'items' && $_->attr('{}node') eq $node}
+			map {$_->children }
+			    grep {$_->element_name eq 'event'}
+				$event->children
+				    if($event && ref($event));
+	@items=("<items node='$node'/>") unless(@items);
+	$res->first_element->{children} = [@items];
+	$res->deliver($self->vh);
+    } else {
+	$logger->error("GET UNKNOWN PEP ".$iq->as_xml);
+    }
 }
 
 =head2 handle_error($self, $stanza)
