@@ -286,17 +286,23 @@ sub get_pep {
     if($what && $what->element_name eq 'items' && $what->attr('{}node')) {
 	my $node = $what->attr('{}node');
 	unless($from->as_bare_string eq $iq->to_jid->as_bare_string or $self->get_pub($iq->to_jid,$node,$from->as_bare_string)) {
-	    # We have neither explicit subscription, nor implied subscription need to check roster
+	    # We have neither explicit nor implied subscription need to check roster
 	    # TODO
 	    my $err = $iq->make_error_response(403,'auth','not-authorized');
 	    return $err->deliver($self->vh);
+	}
+	unless($self->get_pub($iq->to_jid,$node)) {
+	    my $ie = $iq->make_error_response(503,'cancel','item-not-found');
+	    $logger->debug("Requested node does not exist: ".$ie->as_xml);
+	    $ie->deliver($self->vh);
+	    return;
 	}
 	my $event = $self->get_pub_last($iq->to_jid,$node);
 	my $res = $iq->clone;
 	$res->set_to($iq->from_jid);
 	$res->set_from($iq->to_jid);
 	$res->set_attr('{}type','result');
-	my @items = grep {$_->element_name eq 'items' && $_->attr('{}node') eq $node}
+	my @items = grep {$_->element_name eq 'items' && $_->attr('{}node') && $_->attr('{}node') eq $node}
 			map {$_->children }
 			    grep {$_->element_name eq 'event'}
 				$event->children
