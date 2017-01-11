@@ -41,15 +41,30 @@ It sets PEP service feature as well as PEP service node, and registers hooks on 
 intercept PEP IQs, disco result IQs and Presence stanzas. Additionally it adds ConnectionClosing and
 PresenceUnavailable hooks to remove explicit subscriptions (to full JID).
 
-=cut
-
-my @pubsub_features = (
+Supported XEP-0060 features implemented here are:
 	'publish',
 	'auto-create',
 	'auto-subscribe',
 	'last-published',
+	'retrieve-items',
 	'access-presence',
 	'presence-subscribe',
+	'presence-notifications',
+	'filtered-notifications',
+
+See L<PERSISTENCE> for notes on non-volatile last-published implementation.
+
+=cut
+
+our @pubsub_features = (
+	'publish',
+	'auto-create',
+	'auto-subscribe',
+	'last-published',
+	'retrieve-items',
+	'access-presence',
+	'presence-subscribe',
+	'presence-notifications',
 	'filtered-notifications',
 );
 sub register {
@@ -287,9 +302,11 @@ sub get_pep {
 	my $node = $what->attr('{}node');
 	unless($from->as_bare_string eq $iq->to_jid->as_bare_string or $self->get_pub($iq->to_jid,$node,$from->as_bare_string)) {
 	    # We have neither explicit nor implied subscription need to check roster
-	    # TODO
-	    my $err = $iq->make_error_response(403,'auth','not-authorized');
-	    return $err->deliver($self->vh);
+	    # Or rather subscriber's publishers cache. Which flags autosubscription is allowed by roster
+	    unless($self->get_subpub($from->as_bare_string,$iq->to_jid->as_bare_string)) {
+		my $err = $iq->make_error_response(403,'auth','not-authorized');
+		return $err->deliver($self->vh);
+	    }
 	}
 	unless($self->get_pub($iq->to_jid,$node)) {
 	    my $ie = $iq->make_error_response(503,'cancel','item-not-found');
@@ -664,7 +681,8 @@ sub set_pub {
 
 Fetches and sets last event published by the user to given pubsub node.
 
-$event is a DJabberd::Message object of type headline containing PEP event (item).
+$event is a DJabberd::Message object of type headline containing PEP event
+(item).
 
 =cut
 
@@ -686,7 +704,8 @@ sub set_pub_last {
 
 =head2 get_pub_nodes($self, $user)
 
-A method which returns all (auto-)created pubsub nodes for the given root collector represented by bare JID.
+A method which returns all (auto-)created pubsub nodes for the given root
+collector represented by bare JID.
 
 Returns array of strings representing pubsub nodeID
 =cut
@@ -752,9 +771,9 @@ sub set_sub {
     $self->{sub}->{$user->as_bare_string}->{$user->as_string} = $sub;
 }
 
-=head2 get_subpub($self, $bsub)
+=head2 get_subpub($self, $bsub[, $bpub])
 =cut
-=head2 set_subpub($self, $bsub, $bpub)
+=head2 set_subpub($self, $bsub, $bpub[, $val])
 
 These calls are used to manage subscriber-to-publisher relationship.
 
@@ -772,13 +791,21 @@ When presence or caps of the user received - get_subpub will be used to build
 specific subscriptions to stop broadcasting events to bare jid and instead
 push them to interested resources only.
 
+In other words - C<if(get_subpub($contact,$user))> tells that B<$user> allows
+autosubscription to his PEP events for the B<$contact> (due to current presence
+subscription state or for any other reason).
+
+And consequently C<$pep->set_subpub($contact,$user,0);> disables autosubsription
+for B<$contact> to B<$user>'s PEP events.
 =cut
 
 sub get_subpub {
     my $self = shift;
     my $bsub = shift;
     return () unless(exists $self->{sub}->{$bsub} && ref($self->{sub}->{$bsub}) && exists $self->{sub}->{$bsub}->{pub});
-    return keys(%{$self->{sub}->{$bsub}->{pub}});
+    my $bpub = shift;
+    return keys(%{$self->{sub}->{$bsub}->{pub}}) unless($bpub);
+    return ((exists $self->{sub}->{$bsub}->{pub}->{$bpub})? $self->{sub}->{$bsub}->{pub}->{$bpub} : undef);
 }
 sub set_subpub {
     my $self = shift;
@@ -815,6 +842,28 @@ sub del_subpub {
     }
     delete $self->{sub}->{$user->as_bare_string}->{$user->as_string};
 }
+
+=head1 PERSISTENCE
+
+This implementation is memory-only last-only. That is - all pep events are
+volatile, PEP node just distributes events in real-time, caching last published
+event only, which will be pushed to subscriber on subscription (presence).
+
+That last message will not survive server restart however that should not be a
+problem because client will re-connect and re-publish its tunes/nicks/moods/etc.
+
+If such last events is required to be persistant - implementation should override
+L<set_pub_last> and <get_pub_last> calls, storing the event and calling SUPER.
+Also would make sense adding C<persistent-items> feature to the list of supported
+features (eg. push(@DJabberd::Plugin::PEP::pubsub_features,'persistent-items');).
+
+Event retrieval is also supported, and will call get_pub_last to fetch the message.
+
+Message is literally DJabberd::Message stanza with type C<headline>, ext-address
+set to full jid of the publisher and items/item/<payload> content.
+
+=cut
+
 =head1 INTERNALS
 =cut
 =head2 Event flow
@@ -834,15 +883,17 @@ Bare JID disco#items received -> send published nodes (if subscribed)
 
 =head2 Structs:
 
-You don't normally need these structs as higher level calls (get/set_) should cover general cases.
+You don't normally need these structs as higher level calls (get/set_) should
+cover general cases.
 
 Capabilities:
 $self->{cap}->{"<node>#<digest>"} = { hash => '(sha-1|sha-256|...), caps => DJabberd::Caps }
 
 Publishers:
-This is probably the most complex structure - as it's (supposedly) most frequently used.
-It's supposed to be fully managed through get/set_pub methods however it could be fully
-managed by those calls, up to setting/getting entire publisher's tree.
+This is probably the most complex structure - as it's (supposedly) most frequently
+used.  It's supposed to be fully managed through get/set_pub methods however it
+could be fully managed by those calls, up to setting/getting entire publisher's
+tree.
 
  $self->{pub}->{'publisher_bare_jid'} = {
     'pubsub_node1' => {
@@ -887,13 +938,17 @@ use this tree to resolve publishers on reception of the disco#info ir presence s
     }
  }
 
-Here "<node>#<digest>" are node and ver fields of XEP-0115 entity capabilities <c> element.
+Here "<node>#<digest>" are node and ver fields of XEP-0115 entity capabilities
+<c> element.
 
-To complete publishers struct for a bare_jid one needs bare_jid's Roster <both and to> and Subscribers struct, where subscribers is built from Caps.
+To complete publishers struct for a bare_jid one needs bare_jid's Roster
+<both and to> and Subscribers struct, where subscribers is built from Caps.
 
-It could be filled in from the opposite end - having publisher's struct one can append it using subscriber's Roster <both and from> and Caps.
+It could be filled in from the opposite end - having publisher's struct one can
+append it using subscriber's Roster <both and from> and Caps.
 
-C<Subscribers> is rather a filter/preferences list, we will broadcast to bare jid the events unless we have explicit subscription with filters.
+C<Subscribers> is rather a filter/preferences list, we will broadcast to bare
+jid the events unless we have explicit subscription with filters.
 
 =cut
 =head1 AUTHOR
