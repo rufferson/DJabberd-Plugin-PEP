@@ -67,12 +67,13 @@ our @pubsub_features = (
 	'presence-notifications',
 	'filtered-notifications',
 );
+
 sub register {
     my ($self,$vhost) = @_;
     my $manage_cb = sub {
 	my ($vh, $cb, $iq, $c) = @_;
 	if($iq->isa("DJabberd::IQ")) {
-	    if((!$iq->to || $iq->to eq $iq->from || $iq->to eq $vh->name) && $iq->signature eq 'set-{'.PUBSUBNS.'}pubsub') {
+	    if((!$iq->to or $iq->to eq $iq->from or $iq->to eq $vh->name) && $iq->signature eq 'set-{'.PUBSUBNS.'}pubsub') {
 		# This is only for direct c2s
 		$logger->debug("PEP Modify: ".$iq->as_xml);
 		$self->set_pep($iq);
@@ -96,7 +97,7 @@ sub register {
     my $handle_cb = sub {
 	my ($vh, $cb, $iq) = @_;
 	if($iq->isa("DJabberd::IQ") && $iq->to && $iq->from) {
-	    if($self->disco_bare_jid($iq,$iq->connection->bound_jid)) {
+	    if($self->disco_bare_jid($iq,$iq->from_jid)) {
 		return $cb->stop_chain;
 	    } elsif ($vh->handles_jid($iq->to_jid) && $iq->signature eq 'get-{'.PUBSUBNS.'}pubsub') {
 		$logger->debug("PEP Query: ".$iq->as_xml);
@@ -108,6 +109,23 @@ sub register {
 	    $self->handle_presence($iq);
 	} elsif($iq->isa("DJabberd::Message") and $iq->to and $iq->to_jid->is_bare and $vh->handles_jid($iq->to_jid) and $iq->attr('{}type') eq 'error') {
 	    return $cb->stop_chain if($self->handle_error($iq));
+	}
+	$cb->decline;
+    };
+    my $ipresnc_cb = sub {
+	my ($vh, $cb, $c) = @_;
+	my $sub = $self->get_sub($c->bound_jid);
+	if($sub && ref($sub) eq 'HASH') {
+	    # check for disco condition: sub is set, has a node and caps is set but is scalar
+	    my $cap = $self->get_cap($sub->{node}) if($sub->{node});
+	    $logger->debug("InitialPresence on C2S[".$c->bound_jid->as_string.']: '.($cap || 'undef').' '.($sub->{node} || 'undef'));
+	    if($cap && !ref($cap)) {
+		# XEP-0115 enabled client pending caps discovery
+		$self->req_cap($c->bound_jid,$sub->{node});
+	    } elsif(!$sub->{node} or @{$sub->{topics}}) {
+		# non-caps client or caps cached already - pending subscription
+		$self->subscribe($c->bound_jid);
+	    }
 	}
 	$cb->decline;
     };
@@ -125,6 +143,8 @@ sub register {
     $vhost->register_hook("switch_incoming_client",$manage_cb);
     # S2S is mainly for presence handler, also disco and bounce
     $vhost->register_hook("switch_incoming_server",$handle_cb);
+    # Whlie we capture presence, we cannot do much until server process it
+    $vhost->register_hook("OnInitialPresence",$ipresnc_cb);
     # Below two should clean up presence cache.
     $vhost->register_hook("ConnectionClosing",$cleanup_cb);
     $vhost->register_hook("AlterPresenceUnavailable",$cleanup_cb);
@@ -149,7 +169,7 @@ sub handle_presence {
     return unless($jid && (!$pres->to or $self->vh->handles_jid($pres->to_jid)));
     if($type eq 'available') {
 	my ($nver,$cap);
-	my ($c) = grep{ ref($_) && $_->element_name eq 'c' && ($_->attr('{}xmlns') || '') eq 'http://jabber.org/protocol/caps'} $pres->children;
+	my ($c) = grep{ ref($_) && $_->element eq '{http://jabber.org/protocol/caps}c'} $pres->children;
 	if($c && ref($c) && $c->isa('DJabberd::XMLElement')) {
 	    my $ver = $c->attr('{}ver');
 	    my $node = $c->attr('{}node');
@@ -158,33 +178,58 @@ sub handle_presence {
 		$nver = "$node#$ver";
 		$cap = $self->get_cap($nver);
 		# The presence came to our account, so we need to know its filters even if we have no publishers at the moment
-		if(!$cap or !exists $cap->{caps}) {
+		if(!$cap or !ref($cap) or !$cap->{caps}) {
+		    $logger->debug("Presence with caps spotted, but caps missing. Preparing to discover $hash $nver from ".$jid->as_string);
+		    # Just note down that we're missing this caps entry
 		    $self->set_cap($nver,$hash);
-		    my $iq = DJabberd::IQ->new('','iq',{from=>$self->vh->name,to=>$jid->as_string,type=>'get'},[
-			DJabberd::XMLElement->new('','query',{ xmlns=>'http://jabber.org/protocol/disco#info', node=>$nver },[])
-		    ]);
-		    $iq->set_attr('{}id','pep-iq-'.$self->{id}++);
-		    $iq->deliver($self->vh);
-		    return; # The reset will be done in disco iq result handler
+		    # We cannot trigger disco as of yet on c2s because at this phase presence is not processed
+		    if($pres->connection->is_server or $pres->connection->is_available) {
+			$self->req_cap($jid,$nver);
+		    } else {
+			# so let's just set empty one to start building request
+			$self->set_sub($jid,$nver);
+		    }
+		    return; # The rest will be done in disco iq result handler
 		}
 	    }
 	}
 	# We're here either because we already have caps or contact does not provide them in the presence
 	my $sub = $self->get_sub($jid);
-	if(!$sub) {
-	    # Supposedly it's a first timer. Let's remember it either by calculating subscriptions or flagging empty one
+	# So, if there's no subscription or new caps differ from current subscription - need to (re)subscribe
+	if(!$sub
+		or (!$sub->{node} && $nver)
+		or ($sub->{node} && !$nver)
+		or ($sub->{node} && $nver && $nver ne $sub->{node}))
+	{
+	    # Let's remember it either by calculating subscriptions or flagging empty one
 	    if($cap) {
-		$self->set_sub($jid,$nver,map{$_->bare}$cap->get('feature'));
+		$self->set_sub($jid,$nver,map{$_->bare}$cap->{caps}->get('feature'));
 	    } else {
 		$self->set_sub($jid);
 	    }
+	    $logger->debug("Presence spotted, preparing to subscribe user ".$jid->as_string." to PEP events");
 	    # and subscribe now to all active PEP nodes according to caps and active publishers
-	    $self->subscribe($jid);
+	    # optionally providing old topics to unsubscribe from missing
+	    $self->subscribe($jid,($sub && @{$sub->{topics}}))
+		if($pres->connection->is_server or $pres->connection->is_available); # skip c2s for same reason
 	}
     } elsif($type eq 'unavailable') {
 	$self->del_subpub($jid);
     }
 }
+
+sub req_cap {
+    my $self = shift;
+    my $user = shift;
+    my $node = shift;
+    $logger->debug("Requesting caps of $node for ".$user->as_string);
+    my $iq = DJabberd::IQ->new('', 'iq', { '{}from'=>$self->vh->name, '{}to'=>$user->as_string, '{}type'=>'get' }, [
+	DJabberd::XMLElement->new('','query',{ xmlns=>'http://jabber.org/protocol/disco#info', node=>$node },[])
+    ]);
+    $iq->set_attr('{}id','pep-iq-'.$self->{id}++);
+    $iq->deliver($self->vh);
+}
+
 sub disco_bare_info {
     # This is static
     return (
@@ -212,7 +257,13 @@ sub disco_bare_jid {
     # if request goes to explicit bare jid of the local user
     if($iq->to && $iq->to_jid->is_bare && $iq->to ne $self->vh->name && $self->vh->handles_jid($iq->to_jid)) {
 	# Handle explicit discovery of the user's bare jid - represent the user with PEP node.
-	if($iq->signature eq 'get-{http://jabber.org/protocol/disco#info}query' or $iq->signature eq 'get-{http://jabber.org/protocol/disco#items}query') {
+	if($iq->signature eq 'get-{http://jabber.org/protocol/disco#info}query'
+	  or $iq->signature eq 'get-{http://jabber.org/protocol/disco#items}query')
+	{
+	    unless($self->check_perms($from,$iq->to_jid)) {
+		my $err = $iq->make_error_response(403,'cancel','not-allowed');
+		return $err->deliver($self->vh);
+	    }
 	    my @stuffing;
 	    if($iq->signature eq 'get-{http://jabber.org/protocol/disco#items}query') {
 		@stuffing = $self->disco_bare_items($iq->to);
@@ -233,26 +284,28 @@ sub disco_bare_jid {
 		return 1;
 	    }
 	}
-    } elsif((!$iq->to || $iq->to eq $self->vh->name) && $iq->signature eq 'result-{http://jabber.org/protocol/disco#info}query') {
+    } elsif((!$iq->to or $iq->to eq $self->vh->name) && $iq->signature eq 'result-{http://jabber.org/protocol/disco#info}query') {
 	# This might be responce to our discovery.
 	my $node = $iq->first_element->attr('{}node') || "";
 	return 0 unless($node); # It wasn't a reply to our request after all, we're always asking for node
-	my $caps = $self->get_cap($node);
-	return 0 unless($caps && !ref($caps)); # The node is set but we don't have it cached. Must be not ours either
+	my $cap = $self->get_cap($node);
+	return 0 unless($cap && !ref($cap)); # The node is set but we don't have it cached. Must be not ours either
 	$logger->info("Got disco result for ".$node." from ".$iq->from);
-	my $cap = DJabberd::Caps->new($iq->first_element->children);
-	my $capdgst = $cap->digest($caps);
+	my $caps = DJabberd::Caps->new($iq->first_element->children_elements);
+	my $capdgst = $caps->digest($cap); # when disco requested cap is set to hash algo
 	my ($nuri,$digest) = split('#',$node);
 	if($digest ne $capdgst) {
-	    $logger->error("Digest mismatch: worng hashing function ".$caps->{hash}."? $digest vs $capdgst");
+	    $logger->error("Digest mismatch: wrong hashing function $cap? $digest vs $capdgst");
 	    $node = "$nuri#$capdgst";
-	    $self->set_cap($nuri,$capdgst,$cap);
 	}
-	if(!$self->get_sub($from)) {
-	    $self->set_sub($from,$node,map{$_->bare}$cap->get('feature'));
-	    $logger->debug("Pending caps received, making subscription for ".$from->as_string);
-	    $self->subscribe($from);
-	}
+	# store caps to the cache
+	$self->set_cap($node,$caps);
+	# If caps changed we may need to unsubscribe some
+	my $old = $self->get_sub($from);
+	my @old = @{$old->{topics}} if($old && ref($old) eq 'HASH' && $old->{node} && ref($old->{topics}) eq 'ARRAY');
+	$self->set_sub($from,$node,map{$_->bare}$caps->get('feature'));
+	$logger->debug("Pending caps received, making subscription for ".$from->as_string);
+	$self->subscribe($from,@old);
 	return 1;
     }
     return 0;
@@ -300,13 +353,9 @@ sub get_pep {
     my $what = $iq->first_element->first_element;
     if($what && $what->element_name eq 'items' && $what->attr('{}node')) {
 	my $node = $what->attr('{}node');
-	unless($from->as_bare_string eq $iq->to_jid->as_bare_string or $self->get_pub($iq->to_jid,$node,$from->as_bare_string)) {
-	    # We have neither explicit nor implied subscription need to check roster
-	    # Or rather subscriber's publishers cache. Which flags autosubscription is allowed by roster
-	    unless($self->get_subpub($from->as_bare_string,$iq->to_jid->as_bare_string)) {
-		my $err = $iq->make_error_response(403,'auth','not-authorized');
-		return $err->deliver($self->vh);
-	    }
+	unless($self->check_perms($from,$iq->to_jid,$node)) {
+	    my $err = $iq->make_error_response(403,'cancel','not-allowed');
+	    return $err->deliver($self->vh);
 	}
 	unless($self->get_pub($iq->to_jid,$node)) {
 	    my $ie = $iq->make_error_response(503,'cancel','item-not-found');
@@ -332,6 +381,20 @@ sub get_pep {
     }
 }
 
+sub check_perms {
+    my $self = shift;
+    my $from = shift;
+    my $user = shift;
+    my $node = shift;
+    # Check implied (own resource) subscription
+    return 1 if($from->as_bare_string eq $user->as_bare_string);
+    # Check subscriber's publishers cache which flags whether autosubscription is allowed by presence
+    return 1 if($self->get_subpub($from->as_bare_string,$user->as_bare_string));
+    # Check explicit (existing) subscription to the node
+    return 1 if($node && $self->get_pub($user,$node,$from->as_bare_string));
+    # nope
+    return 0;
+}
 =head2 handle_error($self, $stanza)
 
 The method handles bounces from subscribed users.
@@ -508,7 +571,7 @@ sub subscribe_to {
 =head2 unsubscribe($self, $bpub, $bsub)
 
 This method supposed to be used when presence subscription between bare pub and
-bare sub has changed AND corresponding info is eflected in the publisher's
+bare sub has changed AND corresponding info is reflected in the publisher's
 roster. As such this method must be called from RosterChange hook, not presence
 subscription type stanza.
 
@@ -531,13 +594,16 @@ sub unsubscribe {
     $self->set_subpub($sub,$pub,0);
 }
 
-=head2 subscribe($self, $user)
+=head2 subscribe($self, $user[, ($topic1, $topic2, ...)])
 
 Subscribe $user to all publishers which are pushing events to $user for interested nodes.
 
 Also for each subscribed node - push last event to the user.
 
 $user should be DJabberd::JID object containing full JID.
+
+Optional list of topics may contain existing (previous) list so that extra items
+from that list will be unsubscribed. This is to support client's filtering refresh.
 
 =cut
 
@@ -552,6 +618,7 @@ sub subscribe {
     my $sub = $self->get_sub($user);
     return if($sub && $sub->{node} && !@{$sub->{topics}}); # We don't need no notifications
     my @topics = @{$sub->{topics}} if($sub && ref($sub) eq 'HASH' && ref($sub->{topics}) eq 'ARRAY');
+    my %old = map {($_ => 1)} @_;
     $logger->debug("User ".$user->as_string." doesn't mind getting PEP events: ".(@topics ? join(', ',@topics):'all'));
     foreach my$bpub(@pubs) {
 	unless($self->get_pub($bpub)) {
@@ -564,6 +631,13 @@ sub subscribe {
 	    # Let's walk through user's interest list and subscribe to matching nodes
 	    foreach my$t(@topics) {
 		$self->subscribe_to($bpub,$t,$user);
+		delete $old{$t};
+	    }
+	    $logger->debug("Unsubscribing ".$user->as_string." from ".join('. ',keys(%old))) if(%old);
+	    foreach my$t(keys(%old)) {
+		# Unsubscribe remaining extra
+		next unless($self->get_pub($bpub,$t)); # node is not published by jid
+		$self->set_pub($bpub,$t,$user->as_bare_string,$user->as_string,0);
 	    }
 	} else {
 	    # No interests - let's subscribe to all available
@@ -580,12 +654,15 @@ sub subscribe {
 
 These calls are used to fill/check Entity Capability [XEP-0115] cache. The caps are used for
 C<filtered-notifications> pubsub feature [XEP-0060]. It's vital to fill subscriber's cache.
-The subscribers table is actually filled from this cache. If caps entry is missing - PEP will
-explicitly request a service discovery [XEP-0030] for the JID having Entity Caps [XEP-0115]
-digest (ver='') in its presence.
+If caps entry is missing - PEP will explicitly request a service discovery [XEP-0030] for the
+JID having Entity Caps [XEP-0115] digest (ver='') in its presence.
 
 $node here is a XEP-0115 node, not pubsub node. This node is usually UserAgent URI.
 
+There's special state of caps which should be temporary only: when presence is received with
+caps digest (ver) but such caps digest is missing in the cache - the caps is set to the
+scalar value of hash algorithm. This indicates that we actively looking to obtain user caps
+via disco#info. When dicovery is fired and result received it is replaced with actual value.
 =cut
 
 sub get_cap {
@@ -597,12 +674,11 @@ sub get_cap {
 sub set_cap {
     my $self = shift;
     my $node = shift;
-    my $ver  = shift;
     my $caps = shift;
-    if($self->{cap}->{"$node#$ver"} and !ref($self->{cap}->{"$node#$ver"})) {
-	$self->{cap}->{"$node#$ver"} = { hash => $self->{cap}->{"$node#$ver"}, caps => $caps};
+    if($self->{cap}->{$node} and !ref($self->{cap}->{$node})) {
+	$self->{cap}->{$node} = { hash => $self->{cap}->{$node}, caps => $caps};
     } else {
-	$self->{cap}->{"$node#$ver"} = $caps;
+	$self->{cap}->{$node} = $caps;
     }
 }
 =head2 get_pub($self,$user,$node,$bare,$full)
@@ -760,14 +836,16 @@ sub set_sub {
     my $self = shift;
     my $user = shift;
     my $node = shift;
-    # Node#ver here is used to flag that empty subscription list means exatly that - no interest expressed explicitly for this UserAgent/Caps
+    # Node#ver here is used to flag that empty subscription list means exactly
+    # that - no interest expressed explicitly for this UserAgent/Caps
     my $sub = { node => $node, topics => []};
     foreach my$f(@_) {
 	if($f =~ /^(.+)\+notify$/) {
 	    push(@{$sub->{topics}},$1);
 	}
     }
-    $self->{sub}->{$user->as_bare_string} = { pub => {} } unless(ref($self->{sub}->{$user->as_bare_string}) eq 'HASH');
+    $self->{sub}->{$user->as_bare_string} = { pub => {} }
+	unless(ref($self->{sub}->{$user->as_bare_string}) eq 'HASH');
     $self->{sub}->{$user->as_bare_string}->{$user->as_string} = $sub;
 }
 
