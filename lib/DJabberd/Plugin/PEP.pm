@@ -44,6 +44,8 @@ PresenceUnavailable hooks to remove explicit subscriptions (to full JID).
 Supported XEP-0060 features implemented here are:
 	'publish',
 	'auto-create',
+	'purge-nodes',
+	'delete-nodes',
 	'auto-subscribe',
 	'last-published',
 	'retrieve-items',
@@ -59,6 +61,8 @@ See L<PERSISTENCE> for notes on non-volatile last-published implementation.
 our @pubsub_features = (
 	'publish',
 	'auto-create',
+	'purge-nodes',
+	'delete-nodes',
 	'auto-subscribe',
 	'last-published',
 	'retrieve-items',
@@ -71,9 +75,12 @@ our @pubsub_features = (
 sub register {
     my ($self,$vhost) = @_;
     my $manage_cb = sub {
-	my ($vh, $cb, $iq, $c) = @_;
+	my ($vh, $cb, $iq) = @_;
 	if($iq->isa("DJabberd::IQ")) {
-	    if((!$iq->to or $iq->to eq $iq->from or $iq->to eq $vh->name) && $iq->signature eq 'set-{'.PUBSUBNS.'}pubsub') {
+	    my $sig = $iq->signature;
+	    if((!$iq->to or $iq->to eq $iq->from or $iq->to eq $vh->name or $iq->to eq $iq->connection->bound_jid->as_bare_string)
+		    and ($sig eq 'set-{'.PUBSUBNS.'}pubsub' or $sig eq 'set-{'.PUBSUBNS.'#owner}pubsub'))
+	    {
 		# This is only for direct c2s
 		$logger->debug("PEP Modify: ".$iq->as_xml);
 		$self->set_pep($iq);
@@ -131,6 +138,7 @@ sub register {
     };
     my $cleanup_cb = sub {
 	my ($vh, $cb, $c) = @_;
+	return $self unless($vh);
 	if($c && $c->isa('DJabberd::Connection::ClientIn') && $c->bound_jid) {
 	    $self->del_subpub($c->bound_jid);
 	} elsif($c && $c->isa('DJabberd::Presence') && $c->from && !$c->from_jid->is_bare) {
@@ -139,6 +147,7 @@ sub register {
 	$cb->decline;
     };
     $self->{vhost} = $vhost;
+    Scalar::Util::weaken($self->{vhost});
     # Publisher/Owner could only be C2S. It also needs to catch presence and disco.
     $vhost->register_hook("switch_incoming_client",$manage_cb);
     # S2S is mainly for presence handler, also disco and bounce
@@ -178,10 +187,10 @@ sub handle_presence {
 		$nver = "$node#$ver";
 		$cap = $self->get_cap($nver);
 		# The presence came to our account, so we need to know its filters even if we have no publishers at the moment
-		if(!$cap or !ref($cap) or !$cap->{caps}) {
-		    $logger->debug("Presence with caps spotted, but caps missing. Preparing to discover $hash $nver from ".$jid->as_string);
+		if(!$cap or !ref($cap)) {
+		    $logger->debug("Presence with caps spotted. Preparing to discover $hash $nver from ".$jid->as_string);
 		    # Just note down that we're missing this caps entry
-		    $self->set_cap($nver,$hash);
+		    $self->set_cap($nver,$hash) unless($cap);
 		    # We cannot trigger disco as of yet on c2s because at this phase presence is not processed
 		    if($pres->connection->is_server or $pres->connection->is_available) {
 			$self->req_cap($jid,$nver);
@@ -190,6 +199,8 @@ sub handle_presence {
 			$self->set_sub($jid,$nver);
 		    }
 		    return; # The rest will be done in disco iq result handler
+		} elsif(!ref($cap)) {
+		    return;
 		}
 	    }
 	}
@@ -335,13 +346,32 @@ to supply what it considers as a trusted C<< from >> Djabberd::JID object.
 sub set_pep {
     my $self = shift;
     my $iq = shift;
+    my $jid = $iq->connection->bound_jid;
+    if($iq->signature eq 'set-{'.PUBSUBNS.'#owner}pubsub') {
+	$logger->debug('PEP Owner ops: '.$iq->innards_as_xml);
+	my $op = $iq->first_element->first_element;
+	my $node = $op->attr('{}node');
+	if($op->element_name eq 'delete') {
+	    $logger->debug("Deleting node $node from ".$jid->as_bare_string);
+	    delete $self->get_pub($jid)->{$node};
+	    $iq->send_result;
+	} elsif($op->element_name eq 'purge') {
+	    # We cannot purge much, just last perhaps
+	    $logger->debug("Purging node $node from ".$jid->as_bare_string);
+	    $self->set_pub_last($jid,$node,undef);
+	    $iq->send_result;
+	} else {
+	    $iq->send_error;
+	}
+	return;
+    }
     my @kids = grep { ref($_) && $_->element_name eq 'publish' } $iq->first_element->children;
     if(!$#kids && $kids[0]->attr('{}node') && $kids[0]->first_element->element_name eq 'item') {
 	my $item = $kids[0]->first_element;
 	my $node = $kids[0]->attr('{}node');
 	$iq->send_result;
 	$logger->debug("Publishing PEP events for ".$iq->from);
-	$self->publish($iq->from_jid, $node, $item);
+	$self->publish($jid, $node, $item);
 	return;
     }
     $iq->send_error
@@ -635,8 +665,8 @@ sub subscribe {
 	    }
 	    $logger->debug("Unsubscribing ".$user->as_string." from ".join('. ',keys(%old))) if(%old);
 	    foreach my$t(keys(%old)) {
-		# Unsubscribe remaining extra
-		next unless($self->get_pub($bpub,$t)); # node is not published by jid
+		# Unsubscribe remaining extra by setting explicit nosub
+		next unless($t && $self->get_pub($bpub,$t)); # node is not published
 		$self->set_pub($bpub,$t,$user->as_bare_string,$user->as_string,0);
 	    }
 	} else {
@@ -791,7 +821,7 @@ sub get_pub_nodes {
     my $user = shift;
     my $pub = $self->get_pub($user);
     return () unless($pub && ref($pub) eq 'HASH');
-    return grep{$_ ne 'last'} keys(%{$pub});
+    return grep{$_ && $_ ne 'last' && ref($pub->{$_})} keys(%{$pub});
 }
 sub get_sub_nodes {
     my $self = shift;
