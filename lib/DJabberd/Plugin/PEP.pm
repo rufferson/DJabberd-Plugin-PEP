@@ -7,7 +7,6 @@ use base 'DJabberd::Plugin';
 use constant {
 	PUBSUBNS => "http://jabber.org/protocol/pubsub",
 };
-use POSIX 'strftime';
 
 our $logger = DJabberd::Log->get_logger();
 
@@ -86,9 +85,8 @@ sub register {
 		$self->set_pep($iq);
 		$cb->stop_chain;
 		return;
-	    } elsif($self->disco_bare_jid($iq,$iq->connection->bound_jid)) {
-		$cb->stop_chain;
-		return;
+	    } elsif($self->disco_result($iq,$iq->connection->bound_jid)) {
+		return $cb->stop_chain;
 	    } elsif ($iq->to && $vh->handles_jid($iq->to_jid) && $iq->signature eq 'get-{'.PUBSUBNS.'}pubsub') {
 		$logger->debug("PEP Query: ".$iq->as_xml);
 		$self->get_pep($iq,$iq->connection->bound_jid);
@@ -104,7 +102,7 @@ sub register {
     my $handle_cb = sub {
 	my ($vh, $cb, $iq) = @_;
 	if($iq->isa("DJabberd::IQ") && $iq->to && $iq->from) {
-	    if($self->disco_bare_jid($iq,$iq->from_jid)) {
+	    if($self->disco_result($iq,$iq->from_jid)) {
 		return $cb->stop_chain;
 	    } elsif ($vh->handles_jid($iq->to_jid) && $iq->signature eq 'get-{'.PUBSUBNS.'}pubsub') {
 		$logger->debug("PEP Query: ".$iq->as_xml);
@@ -163,6 +161,19 @@ sub register {
     foreach my $psf(@pubsub_features) {
 	$vhost->caps->add(DJabberd::Caps::Feature->new(PUBSUBNS.'#'.$psf));
     }
+    $vhost->register_hook("DiscoBare", sub {
+	my ($vh,$cb,$iq,$disco,$bare,$from,$ri) = @_;
+	if($disco eq 'info' && $ri && ref($ri) && $ri->subscription->{from}) {
+	    return $cb->addFeatures(['pubsub','pep'],map{PUBSUBNS."#$_"}@pubsub_features);
+	} elsif($disco eq 'items') {
+	    if($ri && ref($ri) && $ri->subscription->{from}) {
+		return $cb->addItems(map{[$bare->as_bare_string,$_]}$self->get_pub_nodes($bare->as_bare_string));
+	    } else {
+		# TODO: list explicit subscriptions for $from
+	    }
+	}
+	$cb->decline;
+    });
     $self->{id} = 0;
 }
 
@@ -241,61 +252,11 @@ sub req_cap {
     $iq->deliver($self->vh);
 }
 
-sub disco_bare_info {
-    # This is static
-    return (
-	DJabberd::XMLElement->new('','identity',{category=>'pubsub', type=>'pep'},[]),
-	DJabberd::XMLElement->new('','feature', {var=>'http://jabber.org/protocol/disco#info'},[]),
-	DJabberd::XMLElement->new('','feature', {var=>'http://jabber.org/protocol/disco#items'},[]),
-	map{DJabberd::XMLElement->new('','feature', {var=>PUBSUBNS.'#'.$_},[])}@pubsub_features
-    );
-}
-sub disco_bare_items {
-    my $self = shift;
-    my $user = shift;
-    my @ret;
-    # List autocreated nodes
-    foreach my$node ($self->get_pub_nodes($user)) {
-	push(@ret,DJabberd::XMLElement->new('','item',{jid=>$user,node=>$node},[]));
-    }
-    return @ret;
-}
-
-sub disco_bare_jid {
+sub disco_result {
     my $self = shift;
     my $iq = shift;
     my $from = shift;
-    # if request goes to explicit bare jid of the local user
-    if($iq->to && $iq->to_jid->is_bare && $iq->to ne $self->vh->name && $self->vh->handles_jid($iq->to_jid)) {
-	# Handle explicit discovery of the user's bare jid - represent the user with PEP node.
-	if($iq->signature eq 'get-{http://jabber.org/protocol/disco#info}query'
-	  or $iq->signature eq 'get-{http://jabber.org/protocol/disco#items}query')
-	{
-	    unless($self->check_perms($from,$iq->to_jid)) {
-		my $err = $iq->make_error_response(403,'cancel','not-allowed');
-		return $err->deliver($self->vh);
-	    }
-	    my @stuffing;
-	    if($iq->signature eq 'get-{http://jabber.org/protocol/disco#items}query') {
-		@stuffing = $self->disco_bare_items($iq->to);
-	    } else {
-		@stuffing = $self->disco_bare_info($iq->to);
-	    }
-	    $logger->info("Got disco request for ".$iq->to." returning ".join(', ',@stuffing));
-	    if(@stuffing) {
-		my $reply = $iq->clone;
-		$reply->set_from($iq->to);
-		$reply->set_to($from ? $from->as_string : $iq->from);
-		$reply->set_connection($iq->connection) if($from);
-		$reply->set_attr('{}type', 'result');
-		# Now stuff the disco
-		$reply->first_element->{children} = \@stuffing;
-		# and fire up
-		$reply->deliver($self->vh);
-		return 1;
-	    }
-	}
-    } elsif((!$iq->to or $iq->to eq $self->vh->name) && $iq->signature eq 'result-{http://jabber.org/protocol/disco#info}query') {
+    if((!$iq->to or $iq->to eq $self->vh->name) && $iq->signature eq 'result-{http://jabber.org/protocol/disco#info}query') {
 	# This might be responce to our discovery.
 	my $node = $iq->first_element->attr('{}node') || "";
 	return 0 unless($node); # It wasn't a reply to our request after all, we're always asking for node
@@ -576,7 +537,7 @@ sub publish {
 	}
     });
     # And finally store for later use (new contacts)
-    $event->push_child( DJabberd::XMLElement->new('','delay',{xmlns=>'urn:xmpp:delay', stamp=>strftime("%Y-%m-%dT%H:%M:%SZ",gmtime)},[]) );
+    DJabberd::Delivery::OfflineStorage::add_delay($event);
     $self->set_pub_last($user,$node,$event);
 }
 
@@ -648,7 +609,7 @@ sub subscribe {
     my $sub = $self->get_sub($user);
     return if($sub && $sub->{node} && !@{$sub->{topics}}); # We don't need no notifications
     my @topics = @{$sub->{topics}} if($sub && ref($sub) eq 'HASH' && ref($sub->{topics}) eq 'ARRAY');
-    my %old = map {($_ => 1)} @_;
+    my %old = map {($_ => 1)} grep @_ if @_;
     $logger->debug("User ".$user->as_string." doesn't mind getting PEP events: ".(@topics ? join(', ',@topics):'all'));
     foreach my$bpub(@pubs) {
 	unless($self->get_pub($bpub)) {
@@ -953,9 +914,10 @@ sub del_subpub {
 
 =head1 PERSISTENCE
 
-This implementation is memory-only last-only. That is - all pep events are
-volatile, PEP node just distributes events in real-time, caching last published
-event only, which will be pushed to subscriber on subscription (presence).
+This implementation is memory-only last-only. That is - all pep events as well
+as PEP nodes are volatile, PEP node is always autocreated and merely distributes
+events in real-time, caching last published event only, which will be pushed to
+subscriber on subscription (presence).
 
 That last message will not survive server restart however that should not be a
 problem because client will re-connect and re-publish its tunes/nicks/moods/etc.
@@ -965,10 +927,14 @@ L<set_pub_last> and <get_pub_last> calls, storing the event and calling SUPER.
 Also would make sense adding C<persistent-items> feature to the list of supported
 features (eg. push(@DJabberd::Plugin::PEP::pubsub_features,'persistent-items');).
 
-Event retrieval is also supported, and will call get_pub_last to fetch the message.
+Event retrieval is also supported, and will call get_pub_last to fetch the message,
+however for that to work with non-volatile events the node should be recovered.
 
 Message is literally DJabberd::Message stanza with type C<headline>, ext-address
 set to full jid of the publisher and items/item/<payload> content.
+
+The node is a hash-ref and pub/sub relationship will be built from roster and
+presence (see L<INTERNALS>).
 
 =cut
 
