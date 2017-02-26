@@ -139,7 +139,7 @@ sub register {
 	return $self unless($vh);
 	if($c && $c->isa('DJabberd::Connection::ClientIn') && $c->bound_jid) {
 	    $self->del_subpub($c->bound_jid);
-	} elsif($c && $c->isa('DJabberd::Presence') && $c->from && !$c->from_jid->is_bare) {
+	} elsif($c && $c->isa('DJabberd::Presence') && $c->from && !$c->from_jid->is_bare && !$c->is_directed) {
 	    $self->del_subpub($c->from_jid);
 	}
 	$cb->decline;
