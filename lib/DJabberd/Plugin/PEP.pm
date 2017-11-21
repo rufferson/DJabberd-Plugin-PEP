@@ -87,7 +87,7 @@ sub register {
 		return;
 	    } elsif($self->disco_result($iq,$iq->connection->bound_jid)) {
 		return $cb->stop_chain;
-	    } elsif ($iq->to && $vh->handles_jid($iq->to_jid) && $iq->signature eq 'get-{'.PUBSUBNS.'}pubsub') {
+	    } elsif((!$iq->to || $vh->handles_jid($iq->to_jid)) && $iq->signature eq 'get-{'.PUBSUBNS.'}pubsub') {
 		$logger->debug("PEP Query: ".$iq->as_xml);
 		$self->get_pep($iq,$iq->connection->bound_jid);
 		$cb->stop_chain;
@@ -332,6 +332,7 @@ sub set_pep {
 	my $node = $kids[0]->attr('{}node');
 	$iq->send_result;
 	$logger->debug("Publishing PEP events for ".$iq->from);
+	$item->replace_ns(PUBSUBNS,'');
 	$self->publish($jid, $node, $item);
 	return;
     }
@@ -344,7 +345,7 @@ sub get_pep {
     my $what = $iq->first_element->first_element;
     if($what && $what->element_name eq 'items' && $what->attr('{}node')) {
 	my $node = $what->attr('{}node');
-	unless($self->check_perms($from,$iq->to_jid,$node)) {
+	unless($self->check_perms($from, ($iq->to_jid || $from), $node)) {
 	    my $err = $iq->make_error_response(403,'cancel','not-allowed');
 	    return $err->deliver($self->vh);
 	}
