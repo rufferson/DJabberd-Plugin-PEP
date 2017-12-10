@@ -24,7 +24,7 @@ our $VERSION = '0.01';
 
 =head1 SYNOPSIS
 
-Implements XEP-0163 Personal Eventing Protocol (PEP) - a part of XMPP Advanced Server compliance [2010].
+Implements XEP-0163 Personal Eventing Protocol (PEP) - a part of XMPP Advanced Server compliance [2010+].
 
     <VHost mydomain.com>
 	<Plugin DJabberd::Plugin::PEP />
@@ -70,6 +70,16 @@ our @pubsub_features = (
 	'presence-notifications',
 	'filtered-notifications',
 );
+
+sub set_config_mode {
+    $_[0]->{sub_mode} = $_[1];
+}
+
+sub finalize {
+    my $self = shift;
+    $self->{sub_mode} ||= 'implicit';
+    return $self->SUPER::finalize(@_);
+}
 
 sub register {
     my ($self,$vhost) = @_;
@@ -213,6 +223,12 @@ sub handle_presence {
 		} elsif(!ref($cap)) {
 		    return;
 		}
+	    } else {
+		$logger->debug('Presence with relict caps spotted: '.$c->as_xml);
+		# if caps are in the presence we're supposed to apply filters
+		# however early xep-0115 versions (1.3) did not include hash
+		return unless($self->{sub_mode} eq 'loose');
+		# In loose mode we treat pre-1.4 caps as no-caps hence no filtering
 	    }
 	}
 	# We're here either because we already have caps or contact does not provide them in the presence
@@ -420,7 +436,7 @@ sub handle_error {
 			$logger->info("Error received from ".$from->as_string." for ".$node." on bare push, cannot unsubscribe bare");
 		    }
 		} else {
-		    $logger->info("Error received from ".$from->as_string." but error misses event body, cannot handle and ignore");
+		    $logger->info("Error received from ".$from->as_string." but error misses event body, cannot handle so ignoring it");
 		}
 	    } elsif($err) {
 		$logger->info("Error received from ".$from->as_string." however error is transient(".$err->attr('{}type').") so ignoring it");
@@ -462,9 +478,9 @@ which was part of the original publish IQ.
 
 It pushes an Event (<message type='headline'><event><item/></event></message>) in three stages. First delivers
 it to all $user's connected resources. Then it sends to all explicit subscriptions (known full JIDs). Finally it
-broadcasts to the remaining roster items with both/to subscription state - similar to presence broadcast.
+broadcasts to the remaining roster items with both/from subscription state - similar to presence broadcast.
 
-The Event (DJabberd::Message object) is stored as last event - to be delivered to accoutns appearing online.
+The Event (DJabberd::Message object) is stored as last event - to be delivered to accounts appearing online.
 
 =cut
 
@@ -486,6 +502,7 @@ sub publish {
     foreach my$con($self->vh->find_conns_of_bare($user)) {
 	$self->emit($event,$con->bound_jid);
     }
+    # All explicit subscriptions
     my $pub = $self->get_pub($user,$node);
     if(ref($pub)) {
 	# Now walk through known subscribers
@@ -632,6 +649,8 @@ sub subscribe {
 		$self->set_pub($bpub,$t,$user->as_bare_string,$user->as_string,0);
 	    }
 	} else {
+	    # unles we use explicit subscription mode
+	    return if($self->{sub_mode} eq 'explicit');
 	    # No interests - let's subscribe to all available
 	    foreach my$t($self->get_pub_nodes($bpub)) {
 		$self->subscribe_to($bpub,$t,$user);
@@ -800,7 +819,7 @@ sub get_sub_nodes {
 These calls are used to manage subscriber's state.
 
 Subscriber's state is a hint, it's not used actively during delivery.  The state
-is set when user sends available presence(goes online) with entity caps visible
+is set when user sends available presence (goes online) with entity caps visible
 on PEP service.
 
 PEP then resolves caps figuring C<+notify> topics and sets them in subscription
@@ -1000,7 +1019,7 @@ Subscribers:
 While local subscribers could be back-resolved from their roster, remote could not enjoy this service
 hence need a back-reference to resolve and build their specific subscriptions. That's achieved by pub
 node of the subscriber's sub tree. It's filled in by publisher when pushing to bare jid. PEP then can
-use this tree to resolve publishers on reception of the disco#info ir presence stanzas with caps.
+use this tree to resolve publishers on reception of the disco#info or presence stanzas with caps.
 
  $self->{sub}->{'subscriber_bare_jid'} =  {
     <subscriber_full_jid>} = {
