@@ -431,7 +431,9 @@ sub handle_error {
 		    my $node = $event->first_element->attr('{}node');
 		    if($self->get_pub($stanza->to,$node,$from->as_bare_string,$from->as_string)) {
 			$logger->info("Error received from ".$from->as_string.", unsubscribing from ".$node);
-			$self->get_pub($stanza->to,$node,$from->as_bare_string,$from->as_string,0);
+			#$self->set_pub($stanza->to,$node,$from->as_bare_string,$from->as_string,0);
+			# Actually if it is err we need to remove entire subscription. Err is not generated for UBM
+			$self->del_sub($from);
 		    } else {
 			$logger->info("Error received from ".$from->as_string." for ".$node." on bare push, cannot unsubscribe bare");
 		    }
@@ -702,7 +704,7 @@ This is publisher management. Allows to get/set any part of the (sub)tree. For d
 
 =item $user
 
-is DJabberd::JID object of the publisher.
+is DJabberd::JID object of the publisher (pubsub node).
 
 =item $node
 
@@ -918,7 +920,9 @@ sub del_subpub {
     my $self = shift;
     my $user = shift;
     return unless($user && ref($user) && !$user->is_bare);
-    foreach my$p(keys(%{$self->{sub}->{$user->as_bare_string}->{pub}})) {
+    my @pubs = keys(%{$self->{sub}->{$user->as_bare_string}->{pub}});
+    $logger->debug("Removing all subscriptions for ".$user->as_string." from ".join(', ', @pubs));
+    foreach my$p(@pubs) {
 	my @nodes;
 	if($self->{sub}->{$user->as_bare_string}->{$user->as_string}->{node}) {
 	    @nodes = $self->get_sub_nodes($user);
@@ -926,7 +930,7 @@ sub del_subpub {
 	    @nodes = $self->get_pub_nodes($p);
 	}
 	foreach my$n(@nodes) {
-	    delete $self->{pub}->{$n}->{$user->as_bare_string}->{$user->as_string}
+	    delete $self->{pub}->{$p}->{$n}->{$user->as_bare_string}->{$user->as_string}
 	}
     }
     delete $self->{sub}->{$user->as_bare_string}->{$user->as_string};
@@ -985,7 +989,7 @@ $self->{cap}->{"<node>#<digest>"} = { hash => '(sha-1|sha-256|...), caps => DJab
 
 Publishers:
 This is probably the most complex structure - as it's (supposedly) most frequently
-used.  It's supposed to be fully managed through get/set_pub methods however it
+used.  It's supposed to be fully managed through get/set_pub methods however. It
 could be fully managed by those calls, up to setting/getting entire publisher's
 tree.
 
@@ -1019,7 +1023,8 @@ Subscribers:
 While local subscribers could be back-resolved from their roster, remote could not enjoy this service
 hence need a back-reference to resolve and build their specific subscriptions. That's achieved by pub
 node of the subscriber's sub tree. It's filled in by publisher when pushing to bare jid. PEP then can
-use this tree to resolve publishers on reception of the disco#info or presence stanzas with caps.
+use this tree to resolve publishers on reception of the disco#info or presence stanzas with caps. In
+the essence it is a presence cache with caps (and topics) and backref to pubs which used this entry.
 
  $self->{sub}->{'subscriber_bare_jid'} =  {
     <subscriber_full_jid>} = {
