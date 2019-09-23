@@ -200,7 +200,9 @@ sub handle_presence {
     if($type eq 'available') {
 	my ($nver,$cap);
 	my ($c) = grep{ ref($_) && $_->element eq '{http://jabber.org/protocol/caps}c'} $pres->children;
-	if($c && ref($c) && $c->isa('DJabberd::XMLElement')) {
+	# filter muc presence, it's useless
+	my ($x) = grep{ ref($_) && $_->element eq '{http://jabber.org/protocol/muc#user}x'} $pres->children;
+	if(!$x && $c && ref($c) && $c->isa('DJabberd::XMLElement')) {
 	    my $ver = $c->attr('{}ver');
 	    my $node = $c->attr('{}node');
 	    my $hash = $c->attr('{}hash');
@@ -499,6 +501,8 @@ sub publish {
 	    DJabberd::XMLElement->new('','items',{node=>$node},[$item])
 	]),
     ]);
+    # Flatten payload to a) avoid deep copy b) speed up serializing c) simplify storage
+    $event->set_raw($event->innards_as_xml);
     $logger->debug("Publishing stuff: $node ".$item->as_xml);
     # All user's resources are implicitly subscribed to all PEP events disregarding their capabilities.
     foreach my$con($self->vh->find_conns_of_bare($user)) {
@@ -558,6 +562,8 @@ sub publish {
     });
     # And finally store for later use (new contacts)
     DJabberd::Delivery::OfflineStorage::add_delay($event);
+    # And flatten it again with delay timestamp
+    $event->set_raw($event->innards_as_xml.$event->first_element->as_xml);
     $self->set_pub_last($user,$node,$event);
 }
 

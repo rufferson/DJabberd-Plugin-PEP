@@ -7,6 +7,7 @@ WriteMakefile(
 	ABSTRACT_FROM => 'lib/DJabberd/Plugin/PEP.pm',
 	PREREQ_PM => {
 		'DJabberd' => '0.86',
+		'DJabberd::Delivery::OfflineStorage' => '0.0.5'
 	},
 	AUTHOR => 'Ruslan N. Marchenko <me@ruff.mobi>',
 );
