@@ -3,6 +3,7 @@ package DJabberd::Plugin::PEP;
 use warnings;
 use strict;
 use base 'DJabberd::Plugin';
+use DJabberd::Delivery::OfflineStorage;
 
 use constant {
 	PUBSUBNS => "http://jabber.org/protocol/pubsub",
@@ -184,6 +185,7 @@ sub register {
 	}
 	$cb->decline;
     });
+    $vhost->register_hook("GetPlugin", sub { $_[1]->set($self) if($_[2] eq __PACKAGE__) });
     $self->{id} = 0;
 }
 
@@ -493,16 +495,16 @@ sub publish {
     my $user = shift;
     my $node = shift;
     my $item = shift;
+    # Flatten payload to a) avoid deep copy b) speed up serializing c) simplify storage
+    $item->set_raw($item->innards_as_xml);
     my $event = DJabberd::Message->new('','message',{'{}from'=>$user->as_bare_string, '{}type'=>'headline'}, [
 	DJabberd::XMLElement->new('','addresses',{xmlns=>'http://jabber.org/protocol/address'},[
-		DJabberd::XMLElement->new('','address',{type=>'replyto', jid => $user->as_string},[])
+	    DJabberd::XMLElement->new('','address',{type=>'replyto', jid => $user->as_string},[])
 	]),
-	DJabberd::XMLElement->new('','event',{xmlns=>PUBSUBNS.'#event'}, [
-	    DJabberd::XMLElement->new('','items',{node=>$node},[$item])
+	DJabberd::XMLElement->new(PUBSUBNS.'#event','event',{xmlns=>PUBSUBNS.'#event'}, [
+	    DJabberd::XMLElement->new(undef,'items',{node=>$node},[$item])
 	]),
     ]);
-    # Flatten payload to a) avoid deep copy b) speed up serializing c) simplify storage
-    $event->set_raw($event->innards_as_xml);
     $logger->debug("Publishing stuff: $node ".$item->as_xml);
     # All user's resources are implicitly subscribed to all PEP events disregarding their capabilities.
     foreach my$con($self->vh->find_conns_of_bare($user)) {
@@ -562,8 +564,6 @@ sub publish {
     });
     # And finally store for later use (new contacts)
     DJabberd::Delivery::OfflineStorage::add_delay($event);
-    # And flatten it again with delay timestamp
-    $event->set_raw($event->innards_as_xml.$event->first_element->as_xml);
     $self->set_pub_last($user,$node,$event);
 }
 
@@ -952,7 +952,7 @@ subscriber on subscription (presence).
 That last message will not survive server restart however that should not be a
 problem because client will re-connect and re-publish its tunes/nicks/moods/etc.
 
-If such last events is required to be persistant - implementation should override
+If such last event is required to be persistant - implementation should override
 L<set_pub_last> and <get_pub_last> calls, storing the event and calling SUPER.
 Also would make sense adding C<persistent-items> feature to the list of supported
 features (eg. push(@DJabberd::Plugin::PEP::pubsub_features,'persistent-items');).
@@ -961,7 +961,8 @@ Event retrieval is also supported, and will call get_pub_last to fetch the messa
 however for that to work with non-volatile events the node should be recovered.
 
 Message is literally DJabberd::Message stanza with type C<headline>, ext-address
-set to full jid of the publisher and items/item/<payload> content.
+set to full jid of the publisher and items/item/<payload> content. Payload is
+pre-serialized to XML to prevent deep copy of the complex structures.
 
 The node is a hash-ref and pub/sub relationship will be built from roster and
 presence (see L<INTERNALS>).
