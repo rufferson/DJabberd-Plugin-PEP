@@ -49,6 +49,7 @@ Supported XEP-0060 features implemented here are:
 	'auto-subscribe',
 	'last-published',
 	'retrieve-items',
+	'publish-options',
 	'access-presence',
 	'presence-subscribe',
 	'presence-notifications',
@@ -66,12 +67,18 @@ our @pubsub_features = (
 	'auto-subscribe',
 	'last-published',
 	'retrieve-items',
+	'publish-options',
 	'access-presence',
 	'presence-subscribe',
 	'presence-notifications',
 	'filtered-notifications',
 );
 
+##
+# mode explicit | implicit | loose
+# explicit is not implemented yet
+# implicit is the default (auto-subscribe)
+# loose is the same except treat old 0115 presence as non-0115 - no disco, no filtering
 sub set_config_mode {
     $_[0]->{sub_mode} = $_[1];
 }
@@ -155,6 +162,13 @@ sub register {
 	}
 	$cb->decline;
     };
+    my $roster_cb = sub {
+	my ($vh, $cb, $jid, $ri) = @_;
+	if(!$ri->from) {
+	    $self->unsubscribe($jid,$ri->jid);
+	}
+	# TODO: Roster group subscription update
+    };
     $self->{vhost} = $vhost;
     Scalar::Util::weaken($self->{vhost});
     # Publisher/Owner could only be C2S. It also needs to catch presence and disco.
@@ -166,8 +180,9 @@ sub register {
     # Below two should clean up presence cache.
     $vhost->register_hook("ConnectionClosing",$cleanup_cb);
     $vhost->register_hook("AlterPresenceUnavailable",$cleanup_cb);
-    # Roster hook should track subscription to presence to forcibely unsubscribe contact
-    # TODO on update/delete hooks doing cleanup. Althoug presence should suffice.
+    # Roster hook should track subscription to presence to forcibely unsubscribe
+    # contact for 'roster' or 'presence' node subscription type
+    $vhost->register_hook("RosterSetItem", $roster_cb);
     $vhost->caps->add(DJabberd::Caps::Identity->new("pubsub","pep","djabberd"));
     foreach my $psf(@pubsub_features) {
 	$vhost->caps->add(DJabberd::Caps::Feature->new(PUBSUBNS.'#'.$psf));
@@ -303,6 +318,66 @@ sub disco_result {
     return 0;
 }
 
+sub parse_conf {
+    my ($self, $xml) = @_;
+    my @fields = (
+	'type',
+	'title',
+	'subscribe',
+	'tempsub',
+	'send_last_published_item',
+	'roster_groups_allowed',
+	'purge_offline',
+	'publish_model',
+	'presence_based_delivery',
+	'persist_items',
+	'notify_sub',
+	'notify_retract',
+	'notify_delete',
+	'notify_config',
+	'notification_type',
+	'node_type',
+	'max_payload_size',
+	'language',
+	'itemreply',
+	'item_expire',
+	'description',
+	'deliver_payloads',
+	'deliver_notifications',
+	'dataform_xslt',
+	['contact'],
+	['collection'],
+	'children_max',
+	['children'],
+	['children_association_whitelist'],
+	'children_association_policy',
+	'body_xslt',
+	{'max_items' => 'max'},
+	{'access_model' => 'pam'},
+    );
+    my $fn;
+    $fn = sub {
+	my ($v) = @_;
+	if(ref($v)) {
+	    if(ref($v) eq 'HASH') {
+		return [values(%$v)]->[0] if($#_);
+		return 'pubsub#'.[keys(%$v)]->[0];
+	    } elsif(ref($v) eq 'ARRAY') {
+		return $fn->($v->[0]);
+	    }
+	} else {
+	    return $#_ ? $v : "pubsub#$v";
+	}
+    };
+    my $fo = DJabberd::Form->new($xml);
+    return undef unless($fo);
+    my $o = {};
+    for my $field (@fields) {
+	$o->{ $fn->($field,1) } = (ref($field) eq 'ARRAY' ? [ $fo->value( $fn->($field) ) ] : [ $fo->value($fn->($field)) ]->[0]) if($fo->value($fn->($field)));
+    }
+    return $o;
+}
+
 =head2 set_pep($self,$iq)
 =cut
 =head2 get_pep($self,$iq,$from)
@@ -342,7 +417,7 @@ sub set_pep {
 	    $self->set_pub_last($jid,$node,undef);
 	    $iq->send_result;
 	} else {
-	    $iq->send_error;
+	    $iq->send_error("<error type='cancel'><feature-not-implemented xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'></error>");
 	}
 	return;
     }
@@ -350,19 +425,53 @@ sub set_pep {
     if(!$#kids && $kids[0]->attr('{}node') && $kids[0]->first_element->element_name eq 'item') {
 	my $item = $kids[0]->first_element;
 	my $node = $kids[0]->attr('{}node');
+	my $pub = $self->get_pub($jid, $node);
+	# Handle publish options for pre-conditions or auto-creation
+	my ($opts) = grep { ref($_) && $_->element_name eq 'publish-options' } $iq->first_element->children;
+	if($opts && $opts->first_element) {
+	    my $o = $self->parse_conf($opts->first_element);
+	    return $iq->send_reply('error', "<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>") unless($o);
+	    $logger->debug("Processing publish-options on node $node for $jid");
+	    if($pub && $pub->{opts}) {
+		# Validate precodnitions
+		for my $k (keys(%$o)) {
+		    return $iq->send_reply('error', "<error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>")
+			unless(defined $pub->{opts}{$k});
+		    my $v = $pub->{opts}{$k};
+		    if(ref($v) eq 'ARRAY' && ref($o->{$k}) eq 'ARRAY') {
+			# new opts should be at least subset of existing
+			return $iq->send_reply('error', "<error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>")
+			    unless(map{my$pov=$_;return grep{$_ eq $pov}@$v}@{$o->{$k}});
+		    } elsif(ref($v) eq 'ARRAY' || ref($o->{$k}) eq 'ARRAY') {
+			# This must not happen as long as we use the same parser for the node config
+			return $iq->send_reply('error', "<error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>");
+		    } else {
+			return $iq->send_reply('error', "<error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>")
+			    unless($v eq $o->{$k});
+		    }
+		}
+	    } elsif(!$pub) {
+		# Pre-create node
+		$pub = $self->set_pub($jid, $node);
+		$pub->{opts} = $o;
+	    }
+	}
 	$iq->send_result;
-	$logger->debug("Publishing PEP events for ".$iq->from);
-	$item->replace_ns(PUBSUBNS,'');
+	$logger->debug("Publishing PEP events for ".$jid->as_bare_string);
+	$item->replace_ns(PUBSUBNS); # strip pubsub ns from the item
 	$self->publish($jid, $node, $item);
 	return;
     }
-    $iq->send_error
+    $iq->send_error("<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'></error>");
 }
+##
+# $from is always set by the caller
 sub get_pep {
     my $self = shift;
     my $iq = shift;
-    my $from = shift;
+    my $from = shift or die('But it must be set?!');
     my $what = $iq->first_element->first_element;
+    # Retrieve items fom the node
     if($what && $what->element_name eq 'items' && $what->attr('{}node')) {
 	my $node = $what->attr('{}node');
 	unless($self->check_perms($from, ($iq->to_jid || $from), $node)) {
@@ -370,26 +479,32 @@ sub get_pep {
 	    return $err->deliver($self->vh);
 	}
 	unless($self->get_pub($iq->to_jid,$node)) {
-	    my $ie = $iq->make_error_response(503,'cancel','item-not-found');
+	    my $ie = $iq->make_error_response(404,'cancel','item-not-found');
 	    $logger->debug("Requested node does not exist: ".$ie->as_xml);
 	    $ie->deliver($self->vh);
 	    return;
 	}
 	my $event = $self->get_pub_last($iq->to_jid,$node);
+	# make_response removes kids, we want to preserve
 	my $res = $iq->clone;
-	$res->set_to($iq->from_jid);
-	$res->set_from($iq->to_jid);
+	$res->set_to($iq->from);
+	$res->set_from($iq->to);
 	$res->set_attr('{}type','result');
 	my @items = grep {$_->element_name eq 'items' && $_->attr('{}node') && $_->attr('{}node') eq $node}
 			map {$_->children }
 			    grep {$_->element_name eq 'event'}
 				$event->children
 				    if($event && ref($event));
-	@items=("<items node='$node'/>") unless(@items);
-	$res->first_element->{children} = [@items];
+	if(@items) {
+	    $res->first_element->{children} = [@items];
+	} else {
+	    $res->first_element->set_raw("<items node='$node'/>");
+	}
 	$res->deliver($self->vh);
     } else {
-	$logger->error("GET UNKNOWN PEP ".$iq->as_xml);
+	$logger->error("GOT UNKNOWN PEP ".$iq->as_xml);
+	my $err = $iq->make_error_response(405,'cancel','not-allowed');
+	return $err->deliver($self->vh);
     }
 }
 
@@ -400,10 +515,27 @@ sub check_perms {
     my $node = shift;
     # Check implied (own resource) subscription
     return 1 if($from->as_bare_string eq $user->as_bare_string);
-    # Check subscriber's publishers cache which flags whether autosubscription is allowed by presence
-    return 1 if($self->get_subpub($from->as_bare_string,$user->as_bare_string));
-    # Check explicit (existing) subscription to the node
-    return 1 if($node && $self->get_pub($user,$node,$from->as_bare_string));
+    if ($node) {
+	my $pub = $self->get_pub($user,$node);
+	# If node doesn't exist it's not allowed as it may be created as whitelist
+	return 0 unless($pub);
+	# Check explicit (existing) subscription to the node
+	return 1 if($pub->{$from->as_bare_string});
+	## PAM checks (pubsub access model)
+	my $opts = $pub->{opts};
+	if(!ref($opts) || $opts->{pam} eq 'presence') {
+	    # Check subscriber's publishers cache which flags whether
+	    # autosubscription is allowed by presence 'from' or 'both'
+	    return 1 if($self->get_subpub($from->as_bare_string,$user->as_bare_string));
+	} elsif(ref($opts) && $opts->{pam} eq 'open') {
+	    # Open is always allowed
+	    return 1;
+	} elsif(ref($opts) && $opts->{pam} eq 'roster') {
+	    # TODO: check roster group membership
+	} elsif(ref($opts) && $opts->{pam} eq 'whitelist') {
+	    # TODO: check affiliations
+	}
+    }
     # nope
     return 0;
 }
@@ -469,7 +601,7 @@ sub emit {
     if($event && ref($event) && UNIVERSAL::isa($event,'DJabberd::Stanza')) {
 	my $e = $event->clone;
 	$e->set_to($to);
-	$e->set_attr('{}id','pep-event-'.($self->{id}++));
+	$e->set_attr('{}id','pep-event-'.($self->{id}++)*100+int(rand(100)));
 	$logger->debug("Emitting PEP Event: ".$e->as_xml);
 	$e->deliver($self->vh);
     }
@@ -497,12 +629,12 @@ sub publish {
     my $item = shift;
     # Flatten payload to a) avoid deep copy b) speed up serializing c) simplify storage
     $item->set_raw($item->innards_as_xml);
-    my $event = DJabberd::Message->new('','message',{'{}from'=>$user->as_bare_string, '{}type'=>'headline'}, [
-	DJabberd::XMLElement->new('','addresses',{xmlns=>'http://jabber.org/protocol/address'},[
-	    DJabberd::XMLElement->new('','address',{type=>'replyto', jid => $user->as_string},[])
+    my $event = DJabberd::Message->new('jabber:client','message',{'{}from'=>$user->as_bare_string, '{}type'=>'headline'}, [
+	DJabberd::XMLElement->new('http://jabber.org/protocol/address','addresses',{xmlns=>'http://jabber.org/protocol/address'},[
+	    DJabberd::XMLElement->new(undef,'address',{'{}type'=>'replyto', '{}jid' => $user->as_string},[])
 	]),
 	DJabberd::XMLElement->new(PUBSUBNS.'#event','event',{xmlns=>PUBSUBNS.'#event'}, [
-	    DJabberd::XMLElement->new(undef,'items',{node=>$node},[$item])
+	    DJabberd::XMLElement->new(undef,'items',{'{}node'=>$node},[$item])
 	]),
     ]);
     $logger->debug("Publishing stuff: $node ".$item->as_xml);
@@ -515,19 +647,25 @@ sub publish {
     if(ref($pub)) {
 	# Now walk through known subscribers
 	foreach my$bare(keys(%{$pub})) {
-	    next if($bare eq 'last');
+	    next if($bare eq 'last' || $bare eq 'opts');
 	    foreach my$full(keys(%{$pub->{$bare}})) {
 		next unless($pub->{$bare}->{$full}); # Negative subscription - filtered out
 		$self->emit($event,$full);
 	    }
 	}
     } else {
-	$self->set_pub($user,$node);
+	$pub = $self->set_pub($user,$node);
     }
-    # Then try to figure something from Roster and Subs
+    # Then try to figure something from Roster and Subs if Access Model is roster based
     $self->vh->get_roster($user,on_success=>sub {
 	my $roster = shift;
-	foreach my$ri($roster->from_items) {
+	my @ris;
+	if(!ref($pub->{opts}) || $pub->{opts}{pam} eq 'presence') {
+	    @ris = $roster->from_items;
+	} elsif(ref($pub->{opts}) && $pub->{opts}{pam} eq 'roster') {
+	    # TODO: build list of RosterItems for the group
+	}
+	foreach my$ri (@ris) {
 	    # check and skip if we have explicit full subsriptions for this bare as [XEP-0163 4.3.2] orders
 	    my $ps = $self->get_pub($user,$node,$ri->jid->as_bare_string);
 	    next if($ps && ref($ps) eq 'HASH' && values(%{$ps}));
@@ -561,7 +699,7 @@ sub publish {
 	    # No presence knowledge, push to the bare
 	    $self->emit($event,$ri->jid->as_bare_string);
 	}
-    });
+    }) if(!ref($pub->{opts}) || $pub->{opts}{pam} eq 'presence' || $pub->{opts}{pam} eq 'roster');
     # And finally store for later use (new contacts)
     DJabberd::Delivery::OfflineStorage::add_delay($event);
     $self->set_pub_last($user,$node,$event);
@@ -589,7 +727,7 @@ sub subscribe_to {
 
 This method supposed to be used when presence subscription between bare pub and
 bare sub has changed AND corresponding info is reflected in the publisher's
-roster. As such this method must be called from RosterChange hook, not presence
+roster. Hence this method must be called from RosterSetItem hook, not presence
 subscription type stanza.
 
 If called from presence - cache may go out-of-sync when following happens:
@@ -601,8 +739,8 @@ which pushes new event through PEP. PEP builds new relationship from Roster.
 
 sub unsubscribe {
     my $self = shift;
-    my $sub = shift;
     my $pub = shift;
+    my $sub = shift;
     # Filter out subscriber's jid from all publisher's topics (pubsub nodes)
     foreach my$topic(keys(%{$self->{pub}->{$pub}})) {
 	delete $self->{pub}->{$pub}->{$topic}->{$sub};
@@ -680,7 +818,7 @@ $node here is a XEP-0115 node, not pubsub node. This node is usually UserAgent U
 
 There's special state of caps which should be temporary only: when presence is received with
 caps digest (ver) but such caps digest is missing in the cache - the caps is set to the
-scalar value of hash algorithm. This indicates that we actively looking to obtain user caps
+scalar value of hash algorithm. This indicates that we're actively looking to obtain user caps
 via disco#info. When dicovery is fired and result received it is replaced with actual value.
 =cut
 
@@ -714,7 +852,7 @@ is DJabberd::JID object of the publisher (pubsub node).
 
 =item $node
 
-is string representing pubsub node - that is a PEP topic, like C<http://jabber.org/protocol/tune>
+is string representing pubsub NodeID - that is a PEP topic, like C<http://jabber.org/protocol/tune>
 
 =item $bare
 
@@ -802,7 +940,7 @@ sub set_pub_last {
 A method which returns all (auto-)created pubsub nodes for the given root
 collector represented by bare JID.
 
-Returns array of strings representing pubsub nodeID
+Returns array of strings representing pubsub nodeID (namespaces)
 =cut
 
 sub get_pub_nodes {
@@ -826,12 +964,13 @@ sub get_sub_nodes {
 
 These calls are used to manage subscriber's state.
 
-Subscriber's state is a hint, it's not used actively during delivery.  The state
-is set when user sends available presence (goes online) with entity caps visible
-on PEP service.
+Subscriber's state is a hint, or presence/cap cache which indicates implicit
+(presence based) subscription request. It's not used actively for publish or
+delivery.  The state is set when user sends available presence (goes online)
+with entity caps visible on PEP service.
 
 PEP then resolves caps figuring C<+notify> topics and sets them in subscription
-state. If later publisher goes online it will use the pre-set hints for
+state. If later publisher goes online it will use the cached pre-set hints for
 C<filtered-notifications> pubsub feature. Presence without notifications will
 still register an entry in sub table, but empty caps entry means catch-all or
 follow-the-presence.
@@ -877,7 +1016,8 @@ These calls are used to manage subscriber-to-publisher relationship.
 Since subscribers can be remote users we cannot get their roster and resovle
 their publishers. Iterating through all publishers and their rosters is tedious
 work. Hence this fast lookup cache is built when publisher pushes the event to
-the contact on the roster.
+the contact on the roster. In other words it is a reversed roster cache (of the
+C<from> subscription types, contact C<$bsub> from user C<$bpub>).
 
 $bsub and $bpub are strings representing bare jid of the subscriber and publisher.
 
@@ -888,7 +1028,7 @@ When presence or caps of the user received - get_subpub will be used to build
 specific subscriptions to stop broadcasting events to bare jid and instead
 push them to interested resources only.
 
-In other words - C<if(get_subpub($contact,$user))> tells that B<$user> allows
+For instance, C<if(get_subpub($contact,$user))> tells that B<$user> allows
 autosubscription to his PEP events for the B<$contact> (due to current presence
 subscription state or for any other reason).
 
@@ -953,12 +1093,13 @@ That last message will not survive server restart however that should not be a
 problem because client will re-connect and re-publish its tunes/nicks/moods/etc.
 
 If such last event is required to be persistant - implementation should override
-L<set_pub_last> and <get_pub_last> calls, storing the event and calling SUPER.
+L<set_pub_last> and L<get_pub_last> calls, storing the event and calling SUPER.
 Also would make sense adding C<persistent-items> feature to the list of supported
 features (eg. push(@DJabberd::Plugin::PEP::pubsub_features,'persistent-items');).
 
 Event retrieval is also supported, and will call get_pub_last to fetch the message,
-however for that to work with non-volatile events the node should be recovered.
+however for that to work with non-volatile events the node should be deserialized
+from the persistent storage.
 
 Message is literally DJabberd::Message stanza with type C<headline>, ext-address
 set to full jid of the publisher and items/item/<payload> content. Payload is
