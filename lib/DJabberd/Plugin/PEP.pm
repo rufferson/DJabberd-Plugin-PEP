@@ -5,9 +5,8 @@ use strict;
 use base 'DJabberd::Plugin';
 use DJabberd::Delivery::OfflineStorage;
 
-use constant {
-	PUBSUBNS => "http://jabber.org/protocol/pubsub",
-};
+use constant PUBSUBNS => 'http://jabber.org/protocol/pubsub';
+use constant EXADDRNS => 'http://jabber.org/protocol/address';
 
 our $logger = DJabberd::Log->get_logger();
 
@@ -95,7 +94,7 @@ sub register {
 	my ($vh, $cb, $iq) = @_;
 	if($iq->isa("DJabberd::IQ")) {
 	    my $sig = $iq->signature;
-	    if((!$iq->to or $iq->to eq $iq->from or $iq->to eq $vh->name or $iq->to eq $iq->connection->bound_jid->as_bare_string)
+	    if((!$iq->to or ($iq->from && $iq->to eq $iq->from) or $iq->to eq $vh->name or $iq->to eq $iq->connection->bound_jid->as_bare_string)
 		    and ($sig eq 'set-{'.PUBSUBNS.'}pubsub' or $sig eq 'set-{'.PUBSUBNS.'#owner}pubsub'))
 	    {
 		# This is only for direct c2s
@@ -163,11 +162,27 @@ sub register {
 	$cb->decline;
     };
     my $roster_cb = sub {
-	my ($vh, $cb, $jid, $ri) = @_;
-	if(!$ri->from) {
-	    $self->unsubscribe($jid,$ri->jid);
-	}
-	# TODO: Roster group subscription update
+	my ($vh, $cb, $for, $ri) = @_;
+	# Let us be quick here, roster is used frequently everywhere
+	Danga::Socket->AddTimer(0, sub {
+	    if(!$ri->subscription->sub_from) {
+		$self->unsubscribe($for,$ri->jid);
+	    } else {
+		# We should convert any transient subscriptions into presence auto-sub
+		$self->set_subpub($ri->jid->as_string, $for->as_bare_string);
+		$logger->debug("Caching presence subscription for ".$ri->jid->as_string." to ".$for->as_bare_string.": ".$self->get_subpub($ri->jid->as_string, $for->as_bare_string));
+		my @jids = $self->get_sub($ri->jid);
+		for my$fjs(@jids) {
+		    my $jid = DJabberd::JID->new($fjs);
+		    my $sub = $self->get_sub($jid);
+		    my $to = ($sub && $sub->{node}) ? [ @{$sub->{topics}} ] : undef;
+		    $logger->debug("Subscribing ".$jid." to $for on ".join(',',($to ? @$to : 'undef')));
+		    $self->subscribe_for($jid, $for, $to);
+		    $self->del_temp_sub($jid);
+		}
+	    }
+	    # TODO: Roster group subscription update
+	});
     };
     $self->{vhost} = $vhost;
     Scalar::Util::weaken($self->{vhost});
@@ -231,6 +246,9 @@ sub handle_presence {
 		    $logger->debug("Presence with caps spotted. Preparing to discover $hash $nver from ".$jid->as_string);
 		    # Just note down that we're missing this caps entry
 		    $self->set_cap($nver,$hash) unless($cap);
+		    # If we don't have presence subscription cached let's cache transient subscription for directed presence
+		    # FIXME: could be a fresh start, when nothing is published (and hence cached) yet.
+		    $self->set_temp_sub($jid, $pres->to_jid) if($pres->to && !$self->get_subpub($jid,$pres->to_jid));
 		    # We cannot trigger disco as of yet on c2s because at this phase presence is not processed
 		    if($pres->connection->is_server or $pres->connection->is_available) {
 			$self->req_cap($jid,$nver);
@@ -272,6 +290,7 @@ sub handle_presence {
 	}
     } elsif($type eq 'unavailable') {
 	$self->del_subpub($jid);
+	$self->unsubscribe($pres->to_jid, $jid) if($pres->to_jid);
     }
 }
 
@@ -280,11 +299,23 @@ sub req_cap {
     my $user = shift;
     my $node = shift;
     $logger->debug("Requesting caps of $node for ".$user->as_string);
-    my $iq = DJabberd::IQ->new('', 'iq', { '{}from'=>$self->vh->name, '{}to'=>$user->as_string, '{}type'=>'get' }, [
-	DJabberd::XMLElement->new('','query',{ xmlns=>'http://jabber.org/protocol/disco#info', node=>$node },[])
+    my $iq = DJabberd::IQ->new(undef, 'iq', { '{}from'=>$self->vh->name, '{}to'=>$user->as_string, '{}type'=>'get' }, [
+	DJabberd::XMLElement->new('http://jabber.org/protocol/disco#info','query',{ xmlns=>'http://jabber.org/protocol/disco#info', '{}node'=>$node },[])
     ]);
-    $iq->set_attr('{}id','pep-iq-'.$self->{id}++);
+    $iq->set_attr('{}id',$self->gen_id);
     $iq->deliver($self->vh);
+}
+
+sub gen_id {
+    my ($self, $type) = @_;
+    $type ||= 'iq';
+    return "pep-$type-".(int(rand(100)) + 100*($self->{id}++));
+}
+sub our_id {
+    my ($self, $id) = @_;
+    return undef unless($id =~ /^pep-(?:event|iq)-(\d+)$/);
+    return undef unless($1 < $self->{id}*100);
+    return $id;
 }
 
 sub disco_result {
@@ -292,8 +323,9 @@ sub disco_result {
     my $iq = shift;
     my $from = shift;
     if((!$iq->to or $iq->to eq $self->vh->name) && $iq->signature eq 'result-{http://jabber.org/protocol/disco#info}query') {
-	# This might be responce to our discovery.
+	# This might be response to our discovery.
 	my $node = $iq->first_element->attr('{}node') || "";
+	return 0 unless($self->our_id($iq->id)); # maybe it was some reply, but is not our id, skip it
 	return 0 unless($node); # It wasn't a reply to our request after all, we're always asking for node
 	my $cap = $self->get_cap($node);
 	return 0 unless($cap && !ref($cap)); # The node is set but we don't have it cached. Must be not ours either
@@ -466,7 +498,7 @@ sub set_pep {
 }
 ##
 # $from is always set by the caller
-sub get_pep {
+sub get_pep($$$) {
     my $self = shift;
     my $iq = shift;
     my $from = shift or die('But it must be set?!');
@@ -556,33 +588,30 @@ sub handle_error {
     my $to = $stanza->to;
     my $from = $stanza->from_jid;
     # Validate origin
-    if($from && !$from->is_bare && $stanza->attr('{}id') =~ /^pep-event-(\d+)$/) {
-	# Validate sequence
-	if($1 < $self->{id}) {
-	    # Passed entry sanity check, capture and handle if possible
-	    my ($err) = grep{$_->element_name eq 'error'}$stanza->children;
-	    if($err && $err->attr('{}type') eq 'cancel') {
-		my ($event) = grep{$_->element_name eq 'event'} $stanza->children;
-		if($event && $event->first_element->element_name eq 'items' && $event->first_element->attr('{}node')) {
-		    my $node = $event->first_element->attr('{}node');
-		    if($self->get_pub($stanza->to,$node,$from->as_bare_string,$from->as_string)) {
-			$logger->info("Error received from ".$from->as_string.", unsubscribing from ".$node);
-			#$self->set_pub($stanza->to,$node,$from->as_bare_string,$from->as_string,0);
-			# Actually if it is err we need to remove entire subscription. Err is not generated for UBM
-			$self->del_sub($from);
-		    } else {
-			$logger->info("Error received from ".$from->as_string." for ".$node." on bare push, cannot unsubscribe bare");
-		    }
+    if($from && !$from->is_bare && $self->our_id($stanza->attr('{}id'))) {
+	# Passed entry sanity check, capture and handle if possible
+	my ($err) = grep{$_->element_name eq 'error'}$stanza->children;
+	if($err && $err->attr('{}type') eq 'cancel') {
+	    my ($event) = grep{$_->element_name eq 'event'} $stanza->children;
+	    if($event && $event->first_element->element_name eq 'items' && $event->first_element->attr('{}node')) {
+		my $node = $event->first_element->attr('{}node');
+		if($self->get_pub($stanza->to,$node,$from->as_bare_string,$from->as_string)) {
+		    $logger->info("Error received from ".$from->as_string.", unsubscribing from ".$node);
+		    $self->del_pub($stanza->to, $node, $from);
+		    # Actually if it is err we need to remove entire subscription. Err is not generated for UBM
+		    $self->del_sub($from);
 		} else {
-		    $logger->info("Error received from ".$from->as_string." but error misses event body, cannot handle so ignoring it");
+		    $logger->info("Error received from ".$from->as_string." for ".$node." on bare push, cannot unsubscribe bare");
 		}
-	    } elsif($err) {
-		$logger->info("Error received from ".$from->as_string." however error is transient(".$err->attr('{}type').") so ignoring it");
 	    } else {
-		$logger->info("Error received from ".$from->as_string." however error descriptor is missing so ignoring it");
+		$logger->info("Error received from ".$from->as_string." but error misses event body, cannot handle so ignoring it");
 	    }
-	    return 1;
+	} elsif($err) {
+	    $logger->info("Error received from ".$from->as_string." however error is transient(".$err->attr('{}type').") so ignoring it");
+	} else {
+	    $logger->info("Error received from ".$from->as_string." however error descriptor is missing so ignoring it");
 	}
+	return 1;
     }
     return 0;
 }
@@ -595,13 +624,17 @@ It adds sender and id attribute to the cloned stanza and delivers it via vhost.
 =cut
 
 sub emit {
-    my $self = shift;
-    my $event = shift;
-    my $to = shift;
+    my ($self, $event, $to) = @_;
     if($event && ref($event) && UNIVERSAL::isa($event,'DJabberd::Stanza')) {
 	my $e = $event->clone;
 	$e->set_to($to);
-	$e->set_attr('{}id','pep-event-'.($self->{id}++)*100+int(rand(100)));
+	$e->set_attr('{}id',$self->gen_id('event'));
+	# Strip extended addressing if we don't have presence subscription cached
+	unless($e->to_jid->as_bare_string eq $e->from_jid->as_bare_string || $self->get_subpub($e->to_jid->as_bare_string, $e->from)) {
+	    $logger->debug("Stripping addressing from ".$e->from." to $to: ".$self->get_subpub($e->to_jid->as_bare_string, $e->from));
+	    my ($ea) = grep {$_->element eq '{'.EXADDRNS.'}addresses'} $e->children_elements;
+	    $e->remove_child($ea) if($ea);
+	}
 	$logger->debug("Emitting PEP Event: ".$e->as_xml);
 	$e->deliver($self->vh);
     }
@@ -611,7 +644,7 @@ sub emit {
 
 This method is used to push the event $item published by $user for topic $node to all subscribers.
 
-$user is DJabberd::JID object. $node is a string representing pubsub node. $item - a DJabberd::XMLElement object
+$user is DJabberd::JID object. $node is a string representing pubsub NodeID. $item - a DJabberd::XMLElement object
 which was part of the original publish IQ.
 
 It pushes an Event (<message type='headline'><event><item/></event></message>) in three stages. First delivers
@@ -630,7 +663,7 @@ sub publish {
     # Flatten payload to a) avoid deep copy b) speed up serializing c) simplify storage
     $item->set_raw($item->innards_as_xml);
     my $event = DJabberd::Message->new('jabber:client','message',{'{}from'=>$user->as_bare_string, '{}type'=>'headline'}, [
-	DJabberd::XMLElement->new('http://jabber.org/protocol/address','addresses',{xmlns=>'http://jabber.org/protocol/address'},[
+	DJabberd::XMLElement->new(EXADDRNS,'addresses',{ xmlns => EXADDRNS },[
 	    DJabberd::XMLElement->new(undef,'address',{'{}type'=>'replyto', '{}jid' => $user->as_string},[])
 	]),
 	DJabberd::XMLElement->new(PUBSUBNS.'#event','event',{xmlns=>PUBSUBNS.'#event'}, [
@@ -667,37 +700,35 @@ sub publish {
 	}
 	foreach my$ri (@ris) {
 	    # check and skip if we have explicit full subsriptions for this bare as [XEP-0163 4.3.2] orders
-	    my $ps = $self->get_pub($user,$node,$ri->jid->as_bare_string);
+	    my $ps = $self->get_pub($user,$node,$ri->jid->as_string);
 	    next if($ps && ref($ps) eq 'HASH' && values(%{$ps}));
 	    # No valid explicit subscriptions, check if we can build one
 	    # But first let's register publisher at subscriber's cache
-	    $self->set_subpub($ri->jid->as_bare_string,$user->as_bare_string);
-	    my $sub = $self->get_sub($ri->jid);
-	    if($sub && ref($sub) eq 'HASH') {
-		# We may have presence data collected already, let see
-		my @jids = grep{$_ ne 'pub'}keys(%{$sub});
-		if(@jids) {
-		    # We do indeed.
-		    foreach my$sjid(@jids) {
-			my @topics = grep{$_ eq $node}@{$sub->{$sjid}->{topics}};
-			if(!$sub->{$sjid}->{node} || @topics) {
-			    # User doesn't have caps or is interested in node notify
-			    $logger->debug("Subscribing $sjid to $node and pushing event");
-			    $self->set_pub($user,$node,$ri->as_bare_string,$sjid);
-			    $self->emit($event,$sjid);
-			} else {
-			    # User sent caps and they don't contain this node
-			    $self->set_pub($user,$node,$ri->as_bare_string,$sjid,0);
-			    $logger->debug("User $sjid doesn't want to receive $node events");
-			}
+	    $self->set_subpub($ri->jid->as_string, $user->as_bare_string);
+	    my @jids = $self->get_sub($ri->jid);
+	    # We may have presence data collected already, let see
+	    if(@jids) {
+		# We do indeed.
+		foreach my$sjid(@jids) {
+		    my $sub = $self->get_sub($ri->jid, $sjid);
+		    my @topics = grep{$_ eq $node}@{$sub->{topics}};
+		    if(!$sub->{node} || @topics) {
+			# User doesn't have caps or is interested in node notify
+			$logger->debug("Subscribing $sjid to $node and pushing event");
+			$self->set_pub($user,$node,$ri->jid->as_string,$sjid);
+			$self->emit($event,$sjid);
+		    } else {
+			# User sent caps and they don't contain this node
+			$self->set_pub($user,$node,$ri->jid->as_string,$sjid,0);
+			$logger->debug("User $sjid doesn't want to receive $node events");
 		    }
-		    next;
 		}
+		next;
 	    }
 	    # If we have no presence cache - we're likely starting up, let's skip flooding till we get one
 	    next unless($self->get_sub);
 	    # No presence knowledge, push to the bare
-	    $self->emit($event,$ri->jid->as_bare_string);
+	    $self->emit($event,$ri->jid->as_string);
 	}
     }) if(!ref($pub->{opts}) || $pub->{opts}{pam} eq 'presence' || $pub->{opts}{pam} eq 'roster');
     # And finally store for later use (new contacts)
@@ -712,11 +743,9 @@ Set user's explicit subscription and push last event from node to him
 =cut
 
 sub subscribe_to {
-    my $self = shift;
-    my $pubj = shift;
-    my $node = shift;
-    my $user = shift;
+    my ($self, $pubj, $node, $user) = @_;
     return unless($self->get_pub($pubj,$node)); # node is not published by jid
+    return if($self->get_pub($pubj,$node,$user)); # already subscribed here
     # Flag the full jid under bare as active for node of pubj
     $self->set_pub($pubj,$node,$user->as_bare_string,$user->as_string,1);
     # Once subscribed - last event should be pushed.
@@ -738,15 +767,42 @@ which pushes new event through PEP. PEP builds new relationship from Roster.
 =cut
 
 sub unsubscribe {
-    my $self = shift;
-    my $pub = shift;
-    my $sub = shift;
+    my ($self, $pub, $sub) = @_;
     # Filter out subscriber's jid from all publisher's topics (pubsub nodes)
-    foreach my$topic(keys(%{$self->{pub}->{$pub}})) {
-	delete $self->{pub}->{$pub}->{$topic}->{$sub};
+    foreach my$topic($self->get_pub_nodes($pub)) {
+	$self->del_pub($pub,$topic,$sub);
     }
     # also remove publisher from subscriber's cache
     $self->set_subpub($sub,$pub,0);
+    $self->del_temp_sub($sub,$pub);
+}
+
+=head2 subscribe_for($self, $user, $pub)
+
+=cut
+
+sub subscribe_for {
+    my ($self, $user, $bpub, $new, $old) = @_;
+    if(ref $new) {
+	# Let's walk through user's interest list and subscribe to matching nodes
+	foreach my$t(@$new) {
+	    $self->subscribe_to($bpub,$t,$user);
+	    delete $old->{$t};
+	}
+	$logger->debug("Unsubscribing ".$user->as_string." from ".join('. ',keys(%$old))) if($old && %$old);
+	foreach my$t(keys(%$old)) {
+	    # Unsubscribe remaining extra by setting explicit nosub
+	    next unless($t && $self->get_pub($bpub,$t)); # node is not published
+	    $self->set_pub($bpub,$t,$user->as_bare_string,$user->as_string,0);
+	}
+    } else {
+	# unless we use explicit subscription mode
+	return if($self->{sub_mode} eq 'explicit');
+	# No interests - let's subscribe to all available
+	foreach my$t($self->get_pub_nodes($bpub)) {
+	    $self->subscribe_to($bpub,$t,$user);
+	}
+    }
 }
 
 =head2 subscribe($self, $user[, ($topic1, $topic2, ...)])
@@ -764,12 +820,14 @@ from that list will be unsubscribed. This is to support client's filtering refre
 
 sub subscribe {
     my $self = shift;
-    my $user = shift;
+    my DJabberd::JID $user = shift;
     # Subsription attempt, may come from either presence event (auto) or explicit subscription request
     $logger->debug("Subscribing user ".$user->as_string." to ".join(', ',@{$self->get_sub($user)->{topics}}));
     # Assuming prsence event - so iterate through roster and find all publishers with both/from presence
     my @pubs = $self->get_subpub($user->as_bare_string);
-    return unless(@pubs); # no one is publishing to the user. TODO: explicit won't work here
+    # Also check XEP-0060 9.1.2 auto-sub presence-sharer case
+    push(@pubs,keys(%{{$self->get_temp_sub($user)}}));
+    return unless(@pubs); # no established or pending subscriptions
     my $sub = $self->get_sub($user);
     return if($sub && $sub->{node} && !@{$sub->{topics}}); # We don't need no notifications
     my @topics = @{$sub->{topics}} if($sub && ref($sub) eq 'HASH' && ref($sub->{topics}) eq 'ARRAY');
@@ -782,26 +840,7 @@ sub subscribe {
 	    next;
 	}
 	$logger->debug('Subscribing '.$user->as_string." to $bpub`s PEP events");
-	if($sub && $sub->{node}) {
-	    # Let's walk through user's interest list and subscribe to matching nodes
-	    foreach my$t(@topics) {
-		$self->subscribe_to($bpub,$t,$user);
-		delete $old{$t};
-	    }
-	    $logger->debug("Unsubscribing ".$user->as_string." from ".join('. ',keys(%old))) if(%old);
-	    foreach my$t(keys(%old)) {
-		# Unsubscribe remaining extra by setting explicit nosub
-		next unless($t && $self->get_pub($bpub,$t)); # node is not published
-		$self->set_pub($bpub,$t,$user->as_bare_string,$user->as_string,0);
-	    }
-	} else {
-	    # unles we use explicit subscription mode
-	    return if($self->{sub_mode} eq 'explicit');
-	    # No interests - let's subscribe to all available
-	    foreach my$t($self->get_pub_nodes($bpub)) {
-		$self->subscribe_to($bpub,$t,$user);
-	    }
-	}
+	$self->subscribe_for($user, $bpub, (($sub && $sub->{node}) ? [@topics] : undef), { %old });
     }
 }
 
@@ -882,10 +921,11 @@ sub get_pub {
     my $node = shift;
     return $self->{pub}->{$bare} unless($node);
     return undef unless(exists $self->{pub}->{$bare}->{$node} && ref($self->{pub}->{$bare}->{$node}) eq 'HASH');
-    my $bsub = shift;
+    my ($bsub,$full) = @_;
     return $self->{pub}->{$bare}->{$node} unless($bsub);
+    ($bsub, $full) = ($bsub->as_bare_string, $bsub->as_string) if(ref $bsub);
+    $full = undef if($full && $bsub eq $full);
     return undef unless(exists $self->{pub}->{$bare}->{$node}->{$bsub} && ref($self->{pub}->{$bare}->{$node}->{$bsub}) eq 'HASH');
-    my $full = shift;
     return $self->{pub}->{$bare}->{$node}->{$bsub} unless($full);
     return undef unless(exists $self->{pub}->{$bare}->{$node}->{$bsub}->{$full});
     return $self->{pub}->{$bare}->{$node}->{$bsub}->{$full};
@@ -906,6 +946,17 @@ sub set_pub {
     return $self->{pub}->{$bare}->{$node}->{$bsub} = $full if($full && ref($full) eq 'HASH');
     $self->{pub}->{$bare}->{$node}->{$bsub} = {} unless($self->get_pub($user,$node,$bsub));
     $self->{pub}->{$bare}->{$node}->{$bsub}->{$full} = shift;
+}
+sub del_pub {
+    my ($self, $user, $node, $sub) = @_;
+    my $pub = ref $user ? $user->as_bare_string : $user;
+    return unless($user && $node);
+    return delete $self->{pub}{$pub}{$node} unless($sub);
+    if(!ref($sub) || $sub->is_bare) {
+	delete $self->{pub}{$pub}{$node}{ (ref $sub ? $sub->as_bare_string : $sub) };
+    } else {
+	delete $self->{pub}{$pub}{$node}{$sub->as_bare_string}{$sub->as_string};
+    }
 }
 
 =head2 get_pub_last($self, $user, $node)
@@ -984,11 +1035,14 @@ representing full jids of contacts with known presence.
 =cut
 
 sub get_sub {
-    my $self = shift;
-    my $user = shift;
+    my ($self, $user, $full) = @_;
+    # return all online full jids captured from presence
     return grep{$_ ne 'pub'}map{keys(%{$_})}values(%{$self->{sub}}) unless($user);
-    return $self->{sub}->{$user} unless(ref($user)); # bare jid string
-    return $self->{sub}->{$user->as_bare_string}->{$user->as_string};
+    # return online full jids for this bare jid (string or object)
+    my $bare = (ref($user) ? $user->as_bare_string : $user);
+    $full = $user->as_string if(ref($user) && !$user->is_bare);
+    return grep{$_ ne 'pub'}keys(%{$self->{sub}->{$user}}) unless($full);
+    return $self->{sub}->{$bare}->{$full};
 }
 sub set_sub {
     my $self = shift;
@@ -1005,6 +1059,11 @@ sub set_sub {
     $self->{sub}->{$user->as_bare_string} = { pub => {} }
 	unless(ref($self->{sub}->{$user->as_bare_string}) eq 'HASH');
     $self->{sub}->{$user->as_bare_string}->{$user->as_string} = $sub;
+}
+sub del_sub {
+    my ($self, $user) = @_;
+    return undef unless(ref($user) && !$user->is_bare);
+    return delete $self->{sub}{$user->as_bare_string}{$user->as_string};
 }
 
 =head2 get_subpub($self, $bsub[, $bpub])
@@ -1049,13 +1108,13 @@ sub set_subpub {
     my $bsub = shift;
     my $bpub = shift;
     $self->{sub}->{$bsub} = { pub => {} } unless(ref($self->{sub}->{$bsub}) eq 'HASH');
-    return $self->{sub}->{$bsub}->{pub}->{$bpub} = 1 if(!@_ or $_[0]); # implicit or explicit set
+    return $self->{sub}->{$bsub}->{pub}->{$bpub} = ($_[0] || 1) if(!@_ or $_[0]); # implicit or explicit set
     return delete $self->{sub}->{$bsub}->{pub}->{$bpub}; # this was a removal call
 }
 
 =head2 del_pubsub()
 
-The call intended to clean up the mess after previous two.
+The call intended to clean up the mess after previous two. And some others. The ultimate unsubscribe.
 
 Actually it tries to remove all bi-directional references between publisher and subscriber but only to remove
 explicit full jid subscription without touching global state. In other words - to reverse explicit subscription
@@ -1066,7 +1125,7 @@ sub del_subpub {
     my $self = shift;
     my $user = shift;
     return unless($user && ref($user) && !$user->is_bare);
-    my @pubs = keys(%{$self->{sub}->{$user->as_bare_string}->{pub}});
+    my @pubs = (keys(%{$self->{sub}->{$user->as_bare_string}->{pub}}), keys(%{{$self->get_temp_sub($user)}}));
     $logger->debug("Removing all subscriptions for ".$user->as_string." from ".join(', ', @pubs));
     foreach my$p(@pubs) {
 	my @nodes;
@@ -1077,9 +1136,67 @@ sub del_subpub {
 	}
 	foreach my$n(@nodes) {
 	    delete $self->{pub}->{$p}->{$n}->{$user->as_bare_string}->{$user->as_string}
+		if(ref $self->{pub}->{$p}->{$n}->{$user->as_bare_string});
 	}
+	$self->del_temp_sub($user,$p);
     }
-    delete $self->{sub}->{$user->as_bare_string}->{$user->as_string};
+    $self->del_sub($user);
+}
+
+=head2 get_temp_sub($self, $sub[, $bpub])
+=cut
+=head2 set_temp_sub($self, $sub, $bpub[, $node1, ...])
+
+Similar to the previous call this call is indicating subscriber-to-publisher
+relationship, however unlike that one it represents relationship not based on
+presence subscriptions but rather explicit subscription requests to specific
+user (and maybe to specific node).
+
+The subscription could be either IQ-based (XEP-0060 6.1.1) or directed-presence
+based (XEP-0060 9.1.3)
+
+The first argument (after $self) should be either DJabberd::JID object or a
+string representing required subscriber's jid serialisation. If JID object is
+passed to C<set> or C<get> calls it will be used to take its full form, 
+C<as_string> which however may contain bare jid. Either way full and bare
+relationships are different and you may need to call it twice to collect both.
+
+The second argument is a JID object or string representing collection node
+(which is bare JID of the publisher). If JID object is passed its
+C<as_bare_string> serialisation form will be taken.
+
+Returns hash with keys being requested publishers and values array ref of
+requested nodes (for IQ) or undef (for directed presence).
+
+=cut
+
+sub set_temp_sub($$$@) {
+    my ($self, $jid, $pub, @nodes) = @_;
+    my $sub = ref($jid) ? $jid->as_string : $jid;
+    $pub = $pub->as_bare_string if ref $pub;
+    $self->{tmp}{$sub}{$pub} = (@nodes ? [ @nodes ] : undef);
+}
+sub get_temp_sub($$;$) {
+    my ($self, $jid, $pub) = @_;
+    $pub = $pub->as_bare_string if ref $pub;
+    my $sub = ref($jid) ? $jid->as_string : $jid;
+    if($pub) {
+	my %ret = ( $pub => $self->{tmp}{$sub}{$pub} )
+	    if(ref $self->{tmp}{$sub} && exists $self->{tmp}{$sub}{$pub});
+	return %ret;
+    }
+    my %ret = %{ $self->{tmp}{$sub} } if(ref($self->{tmp}{$sub}));
+    return %ret;
+}
+sub del_temp_sub($$;$$) {
+    my ($self, $jid, $pub,$node) = @_;
+    my $sub = ref($jid) ? $jid->as_string : $jid;
+    $pub = $pub->as_bare_string if ref $pub;
+    return delete $self->{tmp}{$sub} unless($pub);
+    return delete $self->{tmp}{$sub}{$pub} unless($node);
+    if(ref $self->{tmp}{$sub}{$pub}) {
+	$self->{tmp}{$sub}{$pub} = [ grep{$_ ne $node}@{$self->{tmp}{$sub}{$pub}} ];
+    }
 }
 
 =head1 PERSISTENCE

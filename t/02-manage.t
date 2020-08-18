@@ -36,12 +36,11 @@ my ($me, $she) = ('partya', 'partyb');
 my ($my, $her) = ('partya@'.$domain, 'partyb@'.$dother);
 my $ecod;
 
-my $res_ok = sub { ok($_[0] =~ /^<iq[^>]+type=['"]result['"]/, "Result: ".$_[0]) };
-my $err_ok = sub { ok($_[0] =~ /^<iq[^>]+type=['"]error['"]/, "Error: ".$_[0]) };
-my $unauth = sub { ok($_[0] =~ /<error[^<]+<not-allowed\s+/m, "AuthError: ".$_[0]) };
-my $ecodok = sub { ok($_[0] =~ /<error[^>]+code=['"]($ecod)['"]/m, "Error[$ecod]: ".$_[0]) };
-my $notimplemented = sub { ok($_[0] =~ /<error[^<]+<feature-not-implemented/m, $_[0]) };
-
+my $res_ok = sub { like($_[0], qr/^<iq[^>]+type=['"]result['"]/, "Is Result") };
+my $err_ok = sub { like($_[0], qr/^<iq[^>]+type=['"]error['"]/,  "Is Error") };
+my $unauth = sub { like($_[0], qr/<error[^<]+<not-allowed\s+/m,  "Is AuthError") };
+my $ecodok = sub { like($_[0], qr/<error[^>]+code=['"]($ecod)['"]/, "Is Error $ecod") };
+my $notimplemented = sub { like($_[0], qr/<error[^<]+<feature-not-implemented/, 'Not implemented') };
 
 my $test;
 my $psq = DJabberd::XMLElement->new('http://jabber.org/protocol/pubsub', 'pubsub', { xmlns => 'http://jabber.org/protocol/pubsub' });
@@ -101,7 +100,7 @@ $iq->set_attr('{}type'=>'get');
 $test = sub {
     my ($res) = @_;
     $res_ok->($res);
-    ok($res =~ /label=['"](My Precious)["']/m, $res);
+    like($res, qr/label=['"](My Precious)["']/, "Has item payload");
 };
 $fc->push_c2s($iq);
 $iq->remove_child($psq);
@@ -166,7 +165,7 @@ $psq->push_child($psi);
 $test = sub {
     my ($res) = @_;
     $res_ok->($res);
-    ok($res =~ /label=['"](My Precious)["']/m, "Item: $res");
+    like($res, qr/label=['"](My Precious)["']/, "Has item payload");
 };
 $fc->push_s2s($iq);
 
@@ -184,7 +183,7 @@ $psq->push_child($pbo);
 $test = sub {
     my ($res) = @_;
     $err_ok->($res);
-    ok($res =~ /<error\s+type=['"]cancel['"]><conflict\s+/m, "Conflict: $res");
+    like($res, qr/<error\s+type=['"]cancel['"]><conflict\s+/, "Causes Conflict");
 };
 $fc->push_c2s($iq);
 
