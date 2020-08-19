@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 use strict;
-use Test::More tests => 16;
+use Test::More tests => 18;
 
 use DJabberd;
 DJabberd::Log::set_logger("main");
@@ -186,7 +186,20 @@ $test = sub {
     like($res, qr/<error\s+type=['"]cancel['"]><conflict\s+/, "Causes Conflict");
 };
 $fc->push_c2s($iq);
+$iq->remove_child($psq);
 
+# and chech what have we configured then
+$pso->remove_child($prg);
+my $cfg = DJabberd::XMLElement->new(undef,'configure',{'{}node'=>$psp->attr('{}node')},[]);
+$pso->push_child($cfg);
+$iq->push_child($pso);
+$iq->set_attr('{}type'=>'get');
+$test = sub {
+    my ($res) = @_;
+    $res_ok->($res);
+    like($res, qr/<field\s+var=['"]pubsub#access_model["'][^>]*>.*<value>open<\/value>/, "PAM is open");
+};
+$fc->push_c2s($iq);
 
 package FakeCon;
 

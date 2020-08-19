@@ -102,6 +102,11 @@ sub register {
 		$self->set_pep($iq);
 		$cb->stop_chain;
 		return;
+	    } elsif((!$iq->to or $iq->to eq $iq->connection->bound_jid->as_bare_string) && $sig eq 'get-{'.PUBSUBNS.'#owner}pubsub') {
+		$logger->debug("PEP Query: ".$iq->as_xml);
+		$self->get_pep($iq,$iq->connection->bound_jid);
+		$cb->stop_chain;
+		return;
 	    } elsif($self->disco_result($iq,$iq->connection->bound_jid)) {
 		return $cb->stop_chain;
 	    } elsif((!$iq->to || $vh->handles_jid($iq->to_jid)) && $iq->signature eq 'get-{'.PUBSUBNS.'}pubsub') {
@@ -350,6 +355,78 @@ sub disco_result {
     return 0;
 }
 
+use constant DEF_OPTS => {
+    pam => 'presence',
+    max => 1,
+    deliver_notifications => 1,
+    last => 'on_sub_and_presence',
+    persist_items => 0,
+    notification_type => 'headline',
+    deliver_payloads => 1,
+};
+sub gen_conf {
+    my ($self, $opts, $type, $short) = @_;
+    if(!ref($opts)) {
+	$opts ||= DEF_OPTS;
+    } elsif(!$short) {
+	my $o = $opts;
+	my @k = keys(%$o);
+	$opts = DEF_OPTS;
+	@{$opts}{@k} = @{$o}{@k};
+    }
+    $type ||= 'form';
+    my %fields = (
+	type => {},
+	title => {},
+	subscribe => {type=>'boolean'},
+	tempsub => {type=>'boolean'},
+	last => {var=>'send_last_published_item', option=>[{value=>'never'},{value=>'on_sub'},{value=>'on_sub_and_presence'}]},
+	roster_groups_allowed => {type=>'list-multi'},
+	purge_offline => {type=>'boolean'},
+	publish_model => {option=>[{value=>'publishers'},{value=>'subscribers'},{value=>'open'}]},
+	presence_based_delivery => {type=>'boolean'},
+	persist_items => {type=>'boolean'},
+	notify_sub => {type=>'boolean'},
+	notify_retract => {type=>'boolean'},
+	notify_delete => {type=>'boolean'},
+	notify_config => {type=>'boolean'},
+	notification_type => {option=>[{value=>'headline'},{value=>'normal'}]},
+	node_type => {option=>[{value=>'leaf'},{value=>'collection'}]},
+	max_payload_size => {},
+	language => {type=>'list-single'},
+	itemreply => {option=>[{value=>'owner'},{value=>'publisher'}]},
+	item_expire => {},
+	description => {},
+	deliver_payloads => {type=>'boolean'},
+	deliver_notifications => {type=>'boolean'},
+	dataform_xslt => {},
+	contact => {type=>'jid-multi'},
+	collection => {type=>'text-multi'},
+	children_max => {},
+	children => {type=>'text-multi'},
+	children_association_whitelist => {type=>'jid-multi'},
+	children_association_policy => {option=>[{value=>'all'},{value=>'owners'},{value=>'whitelist'}]},
+	body_xslt => {},
+	max => {var=>'max_items'},
+	pam => {var=>'access_model', option=>[{value=>'presence'},{value=>'roster'},{value=>'open'},{value=>'whitelist'}]},
+    );
+    my $form = [ {var=>'FORM_TYPE', type=>'hidden', value=>[PUBSUBNS.'#node_config']} ];
+    for my $opt (keys(%{ $opts })) {
+	my $field = $fields{$opt} or die("This option[$opt] does not belong here");
+	$field->{var} = 'pubsub#'.($field->{var} || $opt);
+	if($type eq 'form') {
+	    $field->{type} ||= ($field->{option} ? 'list-single' : 'text-single');
+	} else {
+	    # strip extras from submission form
+	    delete $field->{type};
+	    delete $field->{label};
+	    delete $field->{option};
+	}
+	$field->{value} = (ref($opts->{$opt}) eq 'ARRAY' ? $opts->{$opt} : [ $opts->{$opt} ]);
+	push(@$form, $field);
+    }
+    return DJabberd::Form->new($type, $form);
+}
 sub parse_conf {
     my ($self, $xml) = @_;
     my @fields = (
@@ -503,8 +580,34 @@ sub get_pep($$$) {
     my $iq = shift;
     my $from = shift or die('But it must be set?!');
     my $what = $iq->first_element->first_element;
+    unless($what && ref($what)) {
+	$logger->error("GOT UNKNOWN PEP ".$iq->as_xml);
+	my $err = $iq->make_error_response(400,'modify','bad-request');
+	return $err->deliver($self->vh);
+    }
+    my $node = $what->attr('{}node');
+    if($iq->signature eq 'get-{'.PUBSUBNS.'#owner}pubsub') {
+	if($what->element_name eq 'configure' && $node) {
+	    my $pub = $self->get_pub($from, $node);
+	    unless($pub && ref($pub)) {
+		my $ie = $iq->make_error_response(404,'cancel','item-not-found');
+		$logger->debug("Requested node does not exist: ".$ie->as_xml);
+		$ie->deliver($self->vh);
+		return;
+	    }
+	    my $res = $iq->clone;
+	    $res->set_to($iq->from);
+	    $res->set_from($iq->to);
+	    $res->set_attr('{}type','result');
+	    my $cfg = $res->first_element->first_element;
+	    my $frm = $self->gen_conf($pub->{opts});
+	    $cfg->push_child($frm->as_element);
+	    $logger->debug("Posting configuration form: ".$cfg->as_xml);
+	    return $res->deliver($self->vh);
+	}
+    }
     # Retrieve items fom the node
-    if($what && $what->element_name eq 'items' && $what->attr('{}node')) {
+    if($what->element_name eq 'items' && $node) {
 	my $node = $what->attr('{}node');
 	unless($self->check_perms($from, ($iq->to_jid || $from), $node)) {
 	    my $err = $iq->make_error_response(403,'cancel','not-allowed');
