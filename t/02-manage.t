@@ -64,7 +64,7 @@ $vhost->register_hook("deliver", sub {
 }, 'DJabberd::Delivery::Local'); # Cheat to intercept S2S delivery
 
 # Smoke test: get a 405 query error
-$ecod=405;
+$ecod=400;
 $test = $ecodok;
 $fc->push_s2s($iq);
 
@@ -197,7 +197,7 @@ $iq->set_attr('{}type'=>'get');
 $test = sub {
     my ($res) = @_;
     $res_ok->($res);
-    like($res, qr/<field\s+var=['"]pubsub#access_model["'][^>]*>.*<value>open<\/value>/, "PAM is open");
+    like($res, qr/<field[^>]+var=['"]pubsub#access_model["'][^>]*>.*<value>open<\/value>/, "PAM is open");
 };
 $fc->push_c2s($iq);
 
