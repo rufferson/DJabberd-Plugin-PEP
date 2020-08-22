@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 use strict;
-use Test::More tests => 18;
+use Test::More tests => 21;
 
 use DJabberd;
 DJabberd::Log::set_logger("main");
@@ -188,7 +188,7 @@ $test = sub {
 $fc->push_c2s($iq);
 $iq->remove_child($psq);
 
-# and chech what have we configured then
+# check what have we configured then
 $pso->remove_child($prg);
 my $cfg = DJabberd::XMLElement->new(undef,'configure',{'{}node'=>$psp->attr('{}node')},[]);
 $pso->push_child($cfg);
@@ -198,8 +198,23 @@ $test = sub {
     my ($res) = @_;
     $res_ok->($res);
     like($res, qr/<field[^>]+var=['"]pubsub#access_model["'][^>]*>.*<value>open<\/value>/, "PAM is open");
+    like($res, qr/<field[^>]+var=['"]pubsub#max_items["'][^>]*>.*<value>1<\/value>/, "Default max is 1");
 };
 $fc->push_c2s($iq);
+
+# apply new config
+$iq->set_attr('{}type' => 'set');
+# Inject some default into the form - will check later if it is stripped
+$frm->{fields}{'pubsub#persist_items'}={value=>[0]};
+push(@{ $frm->{order} }, 'pubsub#persist_items');
+$frm->{fields}->{FORM_TYPE}->{value}->[0] = 'http://jabber.org/protocol/pubsub#node_config';
+$xfr = $frm->as_element or diag($frm->as_xml);
+$cfg->push_child($xfr);
+$test = $res_ok;
+$fc->push_c2s($iq);
+
+my $node_cfg = $pep->get_pub_cfg($fc->bound_jid,$psp->attr('{}node'),1);
+ok($node_cfg->{pam} eq 'open' && $node_cfg->{max} == 10 && !exists $node_cfg->{persist_items}, "Config is applied and default field is stripped");
 
 package FakeCon;
 

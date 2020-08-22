@@ -43,6 +43,7 @@ PresenceUnavailable hooks to remove explicit subscriptions (to full JID).
 Supported XEP-0060 features implemented here are:
 	'publish',
 	'auto-create',
+	'config-node',
 	'purge-nodes',
 	'delete-nodes',
 	'auto-subscribe',
@@ -61,6 +62,7 @@ See L<PERSISTENCE> for notes on non-volatile last-published implementation.
 our @pubsub_features = (
 	'publish',
 	'auto-create',
+	'config-node',
 	'purge-nodes',
 	'delete-nodes',
 	'auto-subscribe',
@@ -72,6 +74,16 @@ our @pubsub_features = (
 	'presence-notifications',
 	'filtered-notifications',
 );
+
+use constant DEF_CFG => {
+    pam => 'presence',
+    max => 1,
+    deliver_notifications => 1,
+    last => 'on_sub_and_presence',
+    persist_items => 0,
+    notification_type => 'headline',
+    deliver_payloads => 1,
+};
 
 ##
 # mode explicit | implicit | loose
@@ -355,25 +367,9 @@ sub disco_result {
     return 0;
 }
 
-use constant DEF_OPTS => {
-    pam => 'presence',
-    max => 1,
-    deliver_notifications => 1,
-    last => 'on_sub_and_presence',
-    persist_items => 0,
-    notification_type => 'headline',
-    deliver_payloads => 1,
-};
 sub gen_conf {
-    my ($self, $opts, $type, $short) = @_;
-    if(!ref($opts)) {
-	$opts ||= DEF_OPTS;
-    } elsif(!$short) {
-	my $o = $opts;
-	my @k = keys(%$o);
-	$opts = DEF_OPTS;
-	@{$opts}{@k} = @{$o}{@k};
-    }
+    my ($self, $cfg, $type) = @_;
+    return undef unless(ref $cfg);
     $type ||= 'form';
     my %fields = (
 	type => {},
@@ -411,7 +407,7 @@ sub gen_conf {
 	pam => {var=>'access_model', option=>[{value=>'presence'},{value=>'roster'},{value=>'open'},{value=>'whitelist'}]},
     );
     my $form = [ {var=>'FORM_TYPE', type=>'hidden', value=>[PUBSUBNS.'#node_config']} ];
-    for my $opt (keys(%{ $opts })) {
+    for my $opt (keys(%{ $cfg })) {
 	my $field = $fields{$opt} or die("This option[$opt] does not belong here");
 	$field->{var} = 'pubsub#'.($field->{var} || $opt);
 	if($type eq 'form') {
@@ -422,13 +418,14 @@ sub gen_conf {
 	    delete $field->{label};
 	    delete $field->{option};
 	}
-	$field->{value} = (ref($opts->{$opt}) eq 'ARRAY' ? $opts->{$opt} : [ $opts->{$opt} ]);
+	$field->{value} = (ref($cfg->{$opt}) eq 'ARRAY' ? $cfg->{$opt} : [ $cfg->{$opt} ]);
 	push(@$form, $field);
     }
     return DJabberd::Form->new($type, $form);
 }
 sub parse_conf {
-    my ($self, $xml) = @_;
+    my ($self, $fo) = @_;
+    return undef unless($fo);
     my @fields = (
 	'type',
 	'title',
@@ -478,8 +475,6 @@ sub parse_conf {
 	    return $#_ ? $v : "pubsub#$v";
 	}
     };
-    my $fo = DJabberd::Form->new($xml);
-    return undef unless($fo);
     my $o = {};
     for my $field (@fields) {
 	$o->{ $fn->($field,1) } = (ref($field) eq 'ARRAY' ? [ $fo->value( $fn->($field) ) ] : [ $fo->value($fn->($field)) ]->[0]) if($fo->value($fn->($field)));
@@ -525,6 +520,19 @@ sub set_pep {
 	    $logger->debug("Purging node $node from ".$jid->as_bare_string);
 	    $self->set_pub_last($jid,$node,undef);
 	    $iq->send_result;
+	} elsif($op->element_name eq 'configure') {
+	    return $iq->send_error("<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'></error>")
+		unless($op->first_element);
+	    my $frm = DJabberd::Form->new($op->first_element);
+	    return $iq->send_error("<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'></error>")
+		unless($frm && (($frm->type eq 'submit'  && $frm->form_type eq PUBSUBNS.'#node_config') || $frm->type eq 'cancel'));
+	    if($frm->type eq 'submit') {
+		$logger->debug("Parsing config for form: ".$frm->as_xml);
+		my $cfg = $self->parse_conf($frm);
+		return $iq->send_error("<error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'></error>")
+		    unless($self->set_pub_cfg($jid, $node, $cfg));
+	    }
+	    $iq->send_result;
 	} else {
 	    $iq->send_error("<error type='cancel'><feature-not-implemented xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'></error>");
 	}
@@ -534,19 +542,23 @@ sub set_pep {
     if(!$#kids && $kids[0]->attr('{}node') && $kids[0]->first_element->element_name eq 'item') {
 	my $item = $kids[0]->first_element;
 	my $node = $kids[0]->attr('{}node');
-	my $pub = $self->get_pub($jid, $node);
 	# Handle publish options for pre-conditions or auto-creation
 	my ($opts) = grep { ref($_) && $_->element_name eq 'publish-options' } $iq->first_element->children;
-	if($opts && $opts->first_element) {
-	    my $o = $self->parse_conf($opts->first_element);
-	    return $iq->send_reply('error', "<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>") unless($o);
+	if($opts && $opts->first_element && $opts->first_element->element eq '{jabber:x:data}x') {
+	    my $frm = DJabberd::Form->new($opts->first_element);
+	    return $iq->send_reply('error', "<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>")
+		unless($frm->type eq'submit' && $frm->form_type eq PUBSUBNS.'#publish-options');
+	    my $o = $self->parse_conf($frm);
+	    return $iq->send_reply('error', "<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>")
+		unless($o);
 	    $logger->debug("Processing publish-options on node $node for $jid");
-	    if($pub && $pub->{opts}) {
+	    my $cfg = $self->get_pub_cfg($jid, $node);
+	    if(ref $cfg) {
 		# Validate precodnitions
 		for my $k (keys(%$o)) {
 		    return $iq->send_reply('error', "<error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>")
-			unless(defined $pub->{opts}{$k});
-		    my $v = $pub->{opts}{$k};
+			unless(defined $cfg->{$k});
+		    my $v = $cfg->{$k};
 		    if(ref($v) eq 'ARRAY' && ref($o->{$k}) eq 'ARRAY') {
 			# new opts should be at least subset of existing
 			return $iq->send_reply('error', "<error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>")
@@ -559,10 +571,10 @@ sub set_pep {
 			    unless($v eq $o->{$k});
 		    }
 		}
-	    } elsif(!$pub) {
+	    } else {
 		# Pre-create node
-		$pub = $self->set_pub($jid, $node);
-		$pub->{opts} = $o;
+		return $iq->send_error("<error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'></error>")
+		    unless($self->set_pub($jid, $node) && $self->set_pub_cfg($jid, $node, $o));
 	    }
 	}
 	$iq->send_result;
@@ -588,8 +600,8 @@ sub get_pep($$$) {
     my $node = $what->attr('{}node');
     if($iq->signature eq 'get-{'.PUBSUBNS.'#owner}pubsub') {
 	if($what->element_name eq 'configure' && $node) {
-	    my $pub = $self->get_pub($from, $node);
-	    unless($pub && ref($pub)) {
+	    my $cfg = $self->get_pub_cfg($from, $node);
+	    unless($cfg && ref($cfg)) {
 		my $ie = $iq->make_error_response(404,'cancel','item-not-found');
 		$logger->debug("Requested node does not exist: ".$ie->as_xml);
 		$ie->deliver($self->vh);
@@ -599,10 +611,10 @@ sub get_pep($$$) {
 	    $res->set_to($iq->from);
 	    $res->set_from($iq->to);
 	    $res->set_attr('{}type','result');
-	    my $cfg = $res->first_element->first_element;
-	    my $frm = $self->gen_conf($pub->{opts});
-	    $cfg->push_child($frm->as_element);
-	    $logger->debug("Posting configuration form: ".$cfg->as_xml);
+	    my $cfx = $res->first_element->first_element;
+	    my $frm = $self->gen_conf($cfg);
+	    $cfx->push_child($frm->as_element);
+	    $logger->debug("Posting configuration form: ".$cfx->as_xml);
 	    return $res->deliver($self->vh);
 	}
     }
@@ -657,17 +669,17 @@ sub check_perms {
 	# Check explicit (existing) subscription to the node
 	return 1 if($pub->{$from->as_bare_string});
 	## PAM checks (pubsub access model)
-	my $opts = $pub->{opts};
-	if(!ref($opts) || $opts->{pam} eq 'presence') {
+	my $cfg = $self->get_pub_cfg($user, $node);
+	if($cfg->{pam} eq 'presence') {
 	    # Check subscriber's publishers cache which flags whether
 	    # autosubscription is allowed by presence 'from' or 'both'
 	    return 1 if($self->get_subpub($from->as_bare_string,$user->as_bare_string));
-	} elsif(ref($opts) && $opts->{pam} eq 'open') {
+	} elsif($cfg->{pam} eq 'open') {
 	    # Open is always allowed
 	    return 1;
-	} elsif(ref($opts) && $opts->{pam} eq 'roster') {
+	} elsif($cfg->{pam} eq 'roster') {
 	    # TODO: check roster group membership
-	} elsif(ref($opts) && $opts->{pam} eq 'whitelist') {
+	} elsif($cfg->{pam} eq 'whitelist') {
 	    # TODO: check affiliations
 	}
     }
@@ -734,7 +746,7 @@ sub emit {
 	$e->set_attr('{}id',$self->gen_id('event'));
 	# Strip extended addressing if we don't have presence subscription cached
 	unless($e->to_jid->as_bare_string eq $e->from_jid->as_bare_string || $self->get_subpub($e->to_jid->as_bare_string, $e->from)) {
-	    $logger->debug("Stripping addressing from ".$e->from." to $to: ".$self->get_subpub($e->to_jid->as_bare_string, $e->from));
+	    $logger->debug("Stripping addressing from ".$e->from." to $to: ".($self->get_subpub($e->to_jid->as_bare_string, $e->from)||'undef'));
 	    my ($ea) = grep {$_->element eq '{'.EXADDRNS.'}addresses'} $e->children_elements;
 	    $e->remove_child($ea) if($ea);
 	}
@@ -783,7 +795,7 @@ sub publish {
     if(ref($pub)) {
 	# Now walk through known subscribers
 	foreach my$bare(keys(%{$pub})) {
-	    next if($bare eq 'last' || $bare eq 'opts');
+	    next if($bare eq 'last' || $bare eq 'cfg');
 	    foreach my$full(keys(%{$pub->{$bare}})) {
 		next unless($pub->{$bare}->{$full}); # Negative subscription - filtered out
 		$self->emit($event,$full);
@@ -792,13 +804,14 @@ sub publish {
     } else {
 	$pub = $self->set_pub($user,$node);
     }
+    my $cfg = $self->get_pub_cfg($user, $node);
     # Then try to figure something from Roster and Subs if Access Model is roster based
     $self->vh->get_roster($user,on_success=>sub {
 	my $roster = shift;
 	my @ris;
-	if(!ref($pub->{opts}) || $pub->{opts}{pam} eq 'presence') {
+	if($cfg->{pam} eq 'presence') {
 	    @ris = $roster->from_items;
-	} elsif(ref($pub->{opts}) && $pub->{opts}{pam} eq 'roster') {
+	} elsif($cfg->{pam} eq 'roster') {
 	    # TODO: build list of RosterItems for the group
 	}
 	foreach my$ri (@ris) {
@@ -833,7 +846,7 @@ sub publish {
 	    # No presence knowledge, push to the bare
 	    $self->emit($event,$ri->jid->as_string);
 	}
-    }) if(!ref($pub->{opts}) || $pub->{opts}{pam} eq 'presence' || $pub->{opts}{pam} eq 'roster');
+    }) if($cfg->{pam} eq 'presence' || $cfg->{pam} eq 'roster');
     # And finally store for later use (new contacts)
     DJabberd::Delivery::OfflineStorage::add_delay($event);
     $self->set_pub_last($user,$node,$event);
@@ -1059,6 +1072,34 @@ sub del_pub {
 	delete $self->{pub}{$pub}{$node}{ (ref $sub ? $sub->as_bare_string : $sub) };
     } else {
 	delete $self->{pub}{$pub}{$node}{$sub->as_bare_string}{$sub->as_string};
+    }
+}
+
+sub set_pub_cfg($$$$) {
+    my ($self, $jid, $node, $cfg) = @_;
+    die("Invalid input") unless(ref($jid) && $node && ref($cfg));
+    my $pub = $self->get_pub($jid, $node);
+    return undef unless(ref($pub) eq 'HASH');
+    # strip defaults
+    for my$k(keys(%{$cfg})) {
+	delete $cfg->{$k} if($cfg->{$k} eq DEF_CFG->{$k});
+    }
+    return $pub->{cfg} = $cfg;
+}
+sub get_pub_cfg($$$) {
+    my ($self, $jid, $node, $short) = @_;
+    my $pub = $self->get_pub($jid, $node);
+    return undef unless(ref($pub) eq 'HASH');
+    if($short) {
+	return $pub->{cfg} if(ref $pub->{cfg});
+	return {};
+    } else {
+	my $ret = { %{ DEF_CFG() } };
+	if(ref $pub->{cfg}) {
+	    my @k = keys(%{ $pub->{cfg} });
+	    @{$ret}{@k} = @{$pub->{cfg}}{@k};
+	}
+	return $ret;
     }
 }
 
