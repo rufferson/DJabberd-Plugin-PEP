@@ -4,6 +4,7 @@ use warnings;
 use strict;
 use base 'DJabberd::Plugin';
 use DJabberd::Delivery::OfflineStorage;
+use Digest::SHA;
 
 use constant PUBSUBNS => 'http://jabber.org/protocol/pubsub';
 use constant EXADDRNS => 'http://jabber.org/protocol/address';
@@ -513,12 +514,12 @@ sub set_pep {
 	my $node = $op->attr('{}node');
 	if($op->element_name eq 'delete') {
 	    $logger->debug("Deleting node $node from ".$jid->as_bare_string);
-	    delete $self->get_pub($jid)->{$node};
+	    $self->del_pub($jid, $node);
 	    $iq->send_result;
 	} elsif($op->element_name eq 'purge') {
 	    # We cannot purge much, just last perhaps
 	    $logger->debug("Purging node $node from ".$jid->as_bare_string);
-	    $self->set_pub_last($jid,$node,undef);
+	    $self->set_pub_last(undef,$jid,$node);
 	    $iq->send_result;
 	} elsif($op->element_name eq 'configure') {
 	    return $iq->send_error("<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'></error>")
@@ -631,22 +632,15 @@ sub get_pep($$$) {
 	    $ie->deliver($self->vh);
 	    return;
 	}
-	my $event = $self->get_pub_last($iq->to_jid,$node);
+	my $max = $what->attr('{}max_items');
+	my $id = $what->first_element->attr('{}id') if($what->first_element);
 	# make_response removes kids, we want to preserve
 	my $res = $iq->clone;
 	$res->set_to($iq->from);
 	$res->set_from($iq->to);
 	$res->set_attr('{}type','result');
-	my @items = grep {$_->element_name eq 'items' && $_->attr('{}node') && $_->attr('{}node') eq $node}
-			map {$_->children }
-			    grep {$_->element_name eq 'event'}
-				$event->children
-				    if($event && ref($event));
-	if(@items) {
-	    $res->first_element->{children} = [@items];
-	} else {
-	    $res->first_element->set_raw("<items node='$node'/>");
-	}
+	my @items = $self->get_pub_last($iq->to_jid, $node, $id, $max);
+	$res->first_element->push_child(wrap_item($node, \@items));
 	$res->deliver($self->vh);
     } else {
 	$logger->error("GOT UNKNOWN PEP ".$iq->as_xml);
@@ -770,39 +764,66 @@ The Event (DJabberd::Message object) is stored as last event - to be delivered t
 
 =cut
 
+sub wrap_item {
+    my ($node, $item, $type, $delay) = @_;
+    Carp::confess("wrong input: $item") unless(!$item || ref $item eq 'HASH' || ref $item eq 'ARRAY');
+    my $items = DJabberd::XMLElement->new(undef,'items',{'{}node'=>$node}, []);
+    if(ref $item eq 'HASH') {
+	$items->push_child(DJabberd::XMLElement->new(undef, 'item', {'{}id'=>$item->{id}},[],$item->{data}));
+    } elsif(ref $item eq 'ARRAY') {
+	for my$i(@{ $item }) {
+	    $items->push_child(DJabberd::XMLElement->new(undef, 'item', {'{}id'=>$i->{id}},[],$i->{data}));
+	}
+    }
+    return $items unless($type);
+    return undef unless($item);
+    return DJabberd::Message->new('jabber:client','message',
+	    {
+		'{}from' => $item->{user}->as_bare_string,
+		'{}type' => $type,
+	    },[
+		DJabberd::XMLElement->new(EXADDRNS,'addresses',{ xmlns => EXADDRNS },[
+		    DJabberd::XMLElement->new(undef,'address',
+			{
+			    '{}type'=>'replyto',
+			    '{}jid' => $item->{user}->as_string},
+			[]),
+		]),
+		DJabberd::XMLElement->new(PUBSUBNS.'#event','event',{xmlns=>PUBSUBNS.'#event'}, [ $items ]),
+		( $delay ? DJabberd::Delivery::OfflineStorage::delay($item->{ts}) : ())
+	    ]);
+}
+
 sub publish {
-    my $self = shift;
-    my $user = shift;
-    my $node = shift;
-    my $item = shift;
-    # Flatten payload to a) avoid deep copy b) speed up serializing c) simplify storage
-    $item->set_raw($item->innards_as_xml);
-    my $event = DJabberd::Message->new('jabber:client','message',{'{}from'=>$user->as_bare_string, '{}type'=>'headline'}, [
-	DJabberd::XMLElement->new(EXADDRNS,'addresses',{ xmlns => EXADDRNS },[
-	    DJabberd::XMLElement->new(undef,'address',{'{}type'=>'replyto', '{}jid' => $user->as_string},[])
-	]),
-	DJabberd::XMLElement->new(PUBSUBNS.'#event','event',{xmlns=>PUBSUBNS.'#event'}, [
-	    DJabberd::XMLElement->new(undef,'items',{'{}node'=>$node},[$item])
-	]),
-    ]);
-    $logger->debug("Publishing stuff: $node ".$item->as_xml);
+    my ($self,$user,$node,$data) = @_;
+    $logger->debug("Publishing stuff: $node ".$data->as_xml);
+    # Prepare item structure for use and storage
+    my $item = {
+	data => $data->innards_as_xml,
+	node => $node,
+	user => $user,
+	ts => scalar time,
+	id => $data->attr('{}id')
+    };
+    $item->{id} ||= Digest::SHA::sha256_base64($item->{data});
+    # And store for later use (new contacts)
+    $self->set_pub_last($item);
+    # Prepare headline event message
+    my $event = wrap_item($node, $item, 'headline');
     # All user's resources are implicitly subscribed to all PEP events disregarding their capabilities.
     foreach my$con($self->vh->find_conns_of_bare($user)) {
 	$self->emit($event,$con->bound_jid);
     }
     # All explicit subscriptions
     my $pub = $self->get_pub($user,$node);
-    if(ref($pub)) {
-	# Now walk through known subscribers
-	foreach my$bare(keys(%{$pub})) {
-	    next if($bare eq 'last' || $bare eq 'cfg');
-	    foreach my$full(keys(%{$pub->{$bare}})) {
-		next unless($pub->{$bare}->{$full}); # Negative subscription - filtered out
-		$self->emit($event,$full);
-	    }
+    # Now walk through known subscribers
+    foreach my$bare(keys(%{$pub})) {
+	# FIXME: we probably shouldn't expose it here, hard to track
+	next if($bare eq '@last@' || $bare eq '@cfg@');
+	foreach my$full(keys(%{$pub->{$bare}})) {
+	    next unless($pub->{$bare}->{$full}); # Negative subscription - filtered out
+	    $self->emit($event,$full);
 	}
-    } else {
-	$pub = $self->set_pub($user,$node);
     }
     my $cfg = $self->get_pub_cfg($user, $node);
     # Then try to figure something from Roster and Subs if Access Model is roster based
@@ -847,9 +868,6 @@ sub publish {
 	    $self->emit($event,$ri->jid->as_string);
 	}
     }) if($cfg->{pam} eq 'presence' || $cfg->{pam} eq 'roster');
-    # And finally store for later use (new contacts)
-    DJabberd::Delivery::OfflineStorage::add_delay($event);
-    $self->set_pub_last($user,$node,$event);
 }
 
 =head2 subscribe_to($self, $pub_jid, $node, $sub_jid)
@@ -865,7 +883,7 @@ sub subscribe_to {
     # Flag the full jid under bare as active for node of pubj
     $self->set_pub($pubj,$node,$user->as_bare_string,$user->as_string,1);
     # Once subscribed - last event should be pushed.
-    $self->emit($self->get_pub_last($pubj,$node),$user);
+    $self->emit(wrap_item($node,$self->get_pub_last($pubj,$node,,1),'headline',1),$user);
 }
 
 =head2 unsubscribe($self, $bpub, $bsub)
@@ -1052,6 +1070,7 @@ sub set_pub {
     my $node = shift;
     my $bsub = shift;
     my $full = shift;
+    Carp::confess("Wrong jid param: $user") if(ref $user && !UNIVERSAL::isa($user, 'DJabberd::JID'));
     my $bare = (ref($user))? $user->as_bare_string : $user;
     return unless($bare); # must be bare JID
     return $self->{pub}->{$bare} = $node if($node && ref($node) eq 'HASH');
@@ -1077,57 +1096,64 @@ sub del_pub {
 
 sub set_pub_cfg($$$$) {
     my ($self, $jid, $node, $cfg) = @_;
-    die("Invalid input") unless(ref($jid) && $node && ref($cfg));
+    Carp::confess("Invalid input") unless(ref($jid) && $node && ref($cfg));
     my $pub = $self->get_pub($jid, $node);
     return undef unless(ref($pub) eq 'HASH');
     # strip defaults
     for my$k(keys(%{$cfg})) {
 	delete $cfg->{$k} if($cfg->{$k} eq DEF_CFG->{$k});
     }
-    return $pub->{cfg} = $cfg;
+    return $pub->{'@cfg@'} = $cfg;
 }
 sub get_pub_cfg($$$) {
     my ($self, $jid, $node, $short) = @_;
     my $pub = $self->get_pub($jid, $node);
     return undef unless(ref($pub) eq 'HASH');
     if($short) {
-	return $pub->{cfg} if(ref $pub->{cfg});
+	return $pub->{'@cfg@'} if(ref $pub->{'@cfg@'});
 	return {};
     } else {
 	my $ret = { %{ DEF_CFG() } };
-	if(ref $pub->{cfg}) {
-	    my @k = keys(%{ $pub->{cfg} });
-	    @{$ret}{@k} = @{$pub->{cfg}}{@k};
+	if(ref $pub->{'@cfg@'}) {
+	    my @k = keys(%{ $pub->{'@cfg@'} });
+	    @{$ret}{@k} = @{$pub->{'@cfg@'}}{@k};
 	}
 	return $ret;
     }
 }
 
-=head2 get_pub_last($self, $user, $node)
+=head2 get_pub_last($self, $user, $node, $id, $max)
 =cut
-=head2 set_pub_last($self, $user, $node, $event)
+=head2 set_pub_last($self, $item, $user, $node, $id)
 
 Fetches and sets last event published by the user to given pubsub node.
 
-$event is a DJabberd::Message object of type headline containing PEP event
-(item).
+$event is a HASHREF object containing published item. See L<INTERNALS>
+for details.
 
+If C<$item> is C<undef> then it wipes (deletes, retracts, purges) the
+content. If C<$id> is provided then single item is retracted, otherwise
+entire node is purged.
 =cut
 
 sub get_pub_last {
-    my $self = shift;
-    my $user = shift;
-    my $node = shift;
+    my ($self, $user, $node, $id, $max) = @_;
     my $pub = $self->get_pub($user,$node);
-    return undef unless($pub && ref($pub) eq 'HASH' && exists $pub->{last});
-    return $pub->{last};
+    return undef unless($pub && ref($pub) eq 'HASH' && exists $pub->{'@last@'});
+    return $pub->{'@last@'};
 }
 sub set_pub_last {
-    my $self = shift;
-    my $user = shift;
-    my $node = shift;
+    my ($self, $item, $user, $node, $id) = @_;
+    Carp::confess("Wrong item: $item") if(ref $item && ref $item ne 'HASH');
+    $user = $item->{user} if(ref $item && !$user);
+    $node = $item->{node} if(ref $item && !$node);
     my $pub = $self->set_pub($user,$node);
-    $pub->{last} = $_[0];
+    # asking to remove something when there's nothing here
+    return if(!ref($item) && !ref($pub->{'@last@'}));
+    # Asking to remove an item which is not here
+    return if(!ref($item) && $id && $id ne $pub->{'@last@'}->{id});
+    # either purge or set/retract last
+    return $pub->{'@last@'} = $item;
 }
 
 =head2 get_pub_nodes($self, $user)
@@ -1143,7 +1169,7 @@ sub get_pub_nodes {
     my $user = shift;
     my $pub = $self->get_pub($user);
     return () unless($pub && ref($pub) eq 'HASH');
-    return grep{$_ && $_ ne 'last' && ref($pub->{$_})} keys(%{$pub});
+    return grep{$_ && $_ ne '@last@' && $_ ne '@cfg@' && ref($pub->{$_})} keys(%{$pub});
 }
 sub get_sub_nodes {
     my $self = shift;
@@ -1348,9 +1374,9 @@ sub del_temp_sub($$;$$) {
 This implementation is memory-only last-only. That is - all pep events as well
 as PEP nodes are volatile, PEP node is always autocreated and merely distributes
 events in real-time, caching last published event only, which will be pushed to
-subscriber on subscription (presence).
+subscriber on subscription (presence) event.
 
-That last message will not survive server restart however that should not be a
+That last message will not survive server restart, that however should not be a
 problem because client will re-connect and re-publish its tunes/nicks/moods/etc.
 
 If such last event is required to be persistant - implementation should override
@@ -1358,16 +1384,19 @@ L<set_pub_last> and L<get_pub_last> calls, storing the event and calling SUPER.
 Also would make sense adding C<persistent-items> feature to the list of supported
 features (eg. push(@DJabberd::Plugin::PEP::pubsub_features,'persistent-items');).
 
-Event retrieval is also supported, and will call get_pub_last to fetch the message,
-however for that to work with non-volatile events the node should be deserialized
-from the persistent storage.
+Event retrieval is also supported, and will call C<get_pub_last> to fetch the
+item[s]. However for that to work for anything but last item the non-volatile
+implementation should store more items in C<set_pub_last> and retrieve more in
+C<get_pub_last> calls. Later has optional parameters C<id> and C<max> which
+are serving as selectors to retrieve specific items from storage.
 
-Message is literally DJabberd::Message stanza with type C<headline>, ext-address
-set to full jid of the publisher and items/item/<payload> content. Payload is
-pre-serialized to XML to prevent deep copy of the complex structures.
+The stored C<item> is a hashref with serialised item XML, NodeId, full JID of
+the publisher and delivery timestamp (see L<INTERNALS>).
 
-The node is a hash-ref and pub/sub relationship will be built from roster and
-presence (see L<INTERNALS>).
+In addition to items persistent implementation would need to override two
+methods - L<set_pub_cfg> and L<del_pub>. Former should call SUPER and save
+config to the persistent storage. And the later will need to properly delete
+pubsub node and then call SUPER to clear runtime state.
 
 =cut
 
@@ -1377,7 +1406,7 @@ presence (see L<INTERNALS>).
 
 Publish -> send headlines to subscribed resources -> get roster -> walk through both/to resources -> push to bare jid -> store last event
 
-Note: all publisher's resources are implicitly subscribed (as presence is)
+Note: all publisher's (available) resources are implicitly subscribed (as presence is)
 
 Presence received -> check digest (ver) -> invalidate subscription if differs -> if subscription missing request caps otherwise ignore
 
@@ -1404,7 +1433,17 @@ tree.
 
  $self->{pub}->{'publisher_bare_jid'} = {
     'pubsub_node1' => {
-	last => DJabberd::Message,
+	'@last@' => {
+	    node => 'pubsub_node1',
+	    data => 'xml_payload_inside_<item>_tags',
+	    user => DJabberd::JID('publisher_full_jid'),
+	    id => 'supplied_id_or_autogenerated_digest',
+	    ts => time()
+	},
+	@cfg@ => {
+	    option => value,
+	    ...,
+	},
 	'subscriber1_bare_jid' => {
 	    'subscriber1_full_jid1' => 1,
 	    ...,
@@ -1419,7 +1458,8 @@ tree.
     },
     ...,
     'pubsub_nodeZ' => {
-	last => DJabberd::Message,
+	'@last@' => { ... },
+	'@cfg@' => { ... },
 	'subscriber1_bare_jid' => {
 	    'subscriber1_full_jid1' => 1,
 	    ...,
@@ -1427,6 +1467,7 @@ tree.
 	...,
     }
  }
+
 
 Subscribers:
 While local subscribers could be back-resolved from their roster, remote could not enjoy this service
