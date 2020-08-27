@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-use 5.008;
+use 5.012;
 use ExtUtils::MakeMaker;
 WriteMakefile(
 	NAME => 'DJabberd::Plugin::PEP',
