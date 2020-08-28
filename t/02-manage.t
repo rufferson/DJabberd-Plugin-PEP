@@ -121,7 +121,7 @@ $iq->set_attr('{}type'=>'get');
 $test = sub {
     my ($res) = @_;
     $res_ok->($res);
-    ok($res =~ /<items node='urn:xmpp:omemo:1:devices'\/>/m, "Empty node");
+    like($res, qr{<items node='urn:xmpp:omemo:1:devices'/>}, "Empty node");
 };
 $fc->push_c2s($iq);
 $iq->remove_child($psq);

@@ -773,6 +773,7 @@ sub wrap_item {
 	$items->push_child(DJabberd::XMLElement->new(undef, 'item', {'{}id'=>$item->{id}},[],$item->{data}));
     } elsif(ref $item eq 'ARRAY') {
 	for my$i(@{ $item }) {
+	    next unless($i); # We may have undef returned and pushed to the array
 	    $items->push_child(DJabberd::XMLElement->new(undef, 'item', {'{}id'=>$i->{id}},[],$i->{data}));
 	}
     }
