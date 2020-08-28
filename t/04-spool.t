@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 use strict;
-use Test::More tests => 35;
+use Test::More tests => 40;
 
 use DJabberd;
 DJabberd::Log::set_logger("main");
@@ -34,6 +34,8 @@ my $vhost = DJabberd::VHost->new(
             plugins     => $plugs,
         );
 
+##
+# High Level Tests: ensure end-to-end functionality is preserved
 my ($me, $she) = ('partya', 'partyb');
 my ($my, $her) = ('partya@'.$domain, 'partyb@'.$dother);
 my $ecod;
@@ -265,6 +267,7 @@ $test = sub {
 $fc->push_c2s($iq);
 
 ######
+# Low Level test: functional test
 # create a new pep instance and ensure it restored the state
 my $pep2 = DJabberd::Plugin::PEP::Spool->new();
 $pep2->set_config_spool_dir('/tmp/_pep_test_');
@@ -272,12 +275,36 @@ $pep2->finalize();
 $pep2->{vhost} = $vhost;
 $pep2->despool();
 
-ok($pep2->get_pub($fc->bound_jid), "Has publisher");
-ok($pep2->get_pub($fc->bound_jid, $psi->attr('{}node')), "Has node");
-ok($pep2->get_pub_last($fc->bound_jid, $psi->attr('{}node'), undef, 1), "Has last item");
-ok($pep2->get_pub_last($fc->bound_jid, $psi->attr('{}node'), undef, 1)->{id} eq 'currentier', "Which is currentier");
-ok($pep2->get_pub_last($fc->bound_jid, $psi->attr('{}node'), 'current'), "Has older item");
-like($pep2->get_pub_last($fc->bound_jid, $psi->attr('{}node'), 'current')->{data}, qr{label=["']My Precious['"]}, "Which is Precious");
+my $user = $fc->bound_jid;
+my $node = $psi->attr('{}node');
+
+## Basic tests over respawn instance
+ok($pep2->get_pub($user), "Has publisher");
+ok($pep2->get_pub($user, $node), "Has node");
+ok($pep2->get_pub_last($user, $node, undef, 1), "Has last item");
+ok($pep2->get_pub_last($user, $node, undef, 1)->{id} eq 'currentier', "Which is currentier");
+ok($pep2->get_pub_last($user, $node, 'current'), "Has older item");
+like($pep2->get_pub_last($user, $node, 'current')->{data}, qr{label=["']My Precious['"]}, "Which is Precious");
+
+## Additional tests
+my $c = $pep2->get_pub_cfg($user, $node, 1);
+$c->{max} = 5;
+$c = {%{$pep2->set_pub_cfg($user, $node, $c)}};
+ok($c->{max} == 5, "New config set");
+
+for my$i(1..10) {
+    $pep2->set_pub_last({user => $user, node => $node, ts => time, id => "current$i", data => "<devices xmlns='urn:xmpp:omemo:1'><device label='dev$i' id='$i'></devices>"});
+}
+my @all = $pep2->get_pub_last($user, $node);
+ok(scalar @all == 5, "Has 5 items") or diag(@all);
+$c->{persist_items} = 0;
+$c = {%{$pep2->set_pub_cfg($user, $node, $c)}};
+ok(!exists $c->{persist_items}, "Config is set");
+my $dn = $pep2->node_dname($user, $node);
+opendir(my $dh, $dn) or die($!);
+my @de = grep{$_ =! /(\.|\.\.|\+cfg\+)/} readdir $dh;
+ok(!@de, "Node Dir is empty");
+ok($pep2->get_pub_last($user, $node), "But node has last");
 
 package FakeCon;
 
