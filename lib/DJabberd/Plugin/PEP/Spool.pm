@@ -179,7 +179,10 @@ sub set_pub_cfg {
 	    $self->retain($dname, $cfg->{max}, $self->get_pub_last($user,$node,undef,$cfg->{max}));
 	}
     } else {
-	$DJabberd::Plugin::PEP::logger->debug("Cfg for $node on $user: Max ".$cfg->{max}." persist ".(defined $ocfg->{persist_items}?$ocfg->{persist_items}:'undef')."<>".(defined$cfg->{persist_items}?$cfg->{persist_items}:'undef'));
+	$DJabberd::Plugin::PEP::logger->debug("Cfg for $node on $user: Max ".
+	    (defined$ocfg->{max}?$ocfg->{max}:'undef').'<>'.(defined$cfg->{max}?$cfg->{max}:'undef').
+	    " persist ".
+	    (defined $ocfg->{persist_items}?$ocfg->{persist_items}:'undef')."<>".(defined$cfg->{persist_items}?$cfg->{persist_items}:'undef'));
     }
     return $cfg;
 }
