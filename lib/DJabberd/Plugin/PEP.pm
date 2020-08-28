@@ -640,6 +640,7 @@ sub get_pep($$$) {
 	$res->set_from($iq->to);
 	$res->set_attr('{}type','result');
 	my @items = $self->get_pub_last($iq->to_jid, $node, $id, $max);
+	$res->first_element->set_raw();
 	$res->first_element->push_child(wrap_item($node, \@items));
 	$res->deliver($self->vh);
     } else {

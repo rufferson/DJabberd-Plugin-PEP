@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 use strict;
-use Test::More tests => 9;
+use Test::More tests => 14;
 
 use DJabberd;
 DJabberd::Log::set_logger("main");
@@ -102,6 +102,7 @@ $stest = sub {
     ok((grep{$_->element eq '{http://jabber.org/protocol/address}addresses'}$e->children_elements), "Has addressing");
 };
 $fc->push_c2s($iq);
+$pbo->remove_child($xfr);
 $psq->remove_child($pbo);
 
 # Send directed presence
@@ -112,6 +113,7 @@ my $dinfo = DJabberd::XMLElement->new('http://jabber.org/protocol/disco#info', '
     DJabberd::XMLElement->new(undef, 'feature', {'{}var'=>'urn:xmpp:omemo:1:devices+notify'}),
     DJabberd::XMLElement->new(undef, 'feature', {'{}var'=>'urn:xmpp:omemo:1:bundles+notify'}),
     DJabberd::XMLElement->new(undef, 'feature', {'{}var'=>'urn:xmpp:avatar:metadata+notify'}),
+    DJabberd::XMLElement->new(undef, 'feature', {'{}var'=>'storage:bookmarks+notify'}),
 ]);
 my $cap = DJabberd::Caps->new($dinfo->children_elements);
 my $prs = DJabberd::Presence->available(from=>DJabberd::JID->new("$her/test"));
@@ -176,6 +178,8 @@ $dtest = sub {
 # but make sure our own pops up
 $stest = $pepevt;
 $fc->push_c2s($iq);
+$item->remove_child($ava_mdx);
+
 # Let's send directed presence again and make sure we still don't have event
 # ignore sent presence
 $stest = $nop;
@@ -200,6 +204,71 @@ $dtest = sub {
 diag("Pushing timers to process roster events");
 Danga::Socket::RunTimers();
 
+##
+# Create private [whitelist] access node
+my $bkm = DJabberd::XMLElement->new('storage:bookmarks','storage',{xmlns=>'storage:bookmarks'},[
+    DJabberd::XMLElement->new(undef,'conference',{
+	    '{}name' => 'The Play&apos;s the Thing',
+	    '{}autojoin' => 'true',
+	    '{}jid' => 'theplay@conference.shakespeare.lit'
+	},[
+	    DJabberd::XMLElement->new(undef,'nick',{},[],"JC")
+	])
+    ]);
+$frm->{fields}->{'pubsub#access_model'}->{value}->[0] = 'whitelist';
+$xfr = $frm->as_element;
+$pbo->push_child($xfr);
+$item->set_attr('{}id' => 'current');
+$item->push_child($bkm);
+$psp->set_attr('{}node' => 'storage:bookmarks');
+$psq->push_child($pbo);
+$dtest = sub {
+    my ($e) = @_;
+    fail("We don't expect anything: ".$e->as_xml);
+};
+$stest = sub {
+    my ($e) = @_;
+    $pepevt->($e);
+};
+$fc->push_c2s($iq);
+$psq->remove_child($psp);
+$psq->remove_child($pbo);
+
+##
+# Try to request bookmarks explicitly from trusted party
+my $psi = DJabberd::XMLElement->new(undef, 'items', { '{}node' => 'storage:bookmarks' }, []);
+$psq->push_child($psi);
+$iq->set_attr('{}type'=>'get');
+$iq->set_from($ri->jid);
+$ecod = 403;
+$dtest = sub {
+    my ($e) = @_;
+    $ecodok->($e->innards_as_xml);
+};
+$fc->push_s2s($iq);
+
+##
+# Repeat the query but now from own resource
+$iq->set_from("$my/test2");
+$dtest = sub {
+    my ($e) = @_;
+    ok($e->type eq 'result', 'Is result');
+    if($e->first_element && $e->first_element->element_name eq 'pubsub') {
+	my $p = $e->first_element;
+	if($p->first_element && $p->first_element->element_name eq 'items') {
+	    my $i = $p->first_element;
+	    if($i->first_element && $i->first_element->element_name eq 'item') {
+		like($i->first_element->innards_as_xml, qr{<storage xmlns=["']storage:bookmarks["']>}, "Has bookmark");
+		return;
+	    } else {
+		fail("Unexpected content:  ".$i->innards_as_xml);
+		return;
+	    }
+	}
+    }
+    fail("Unexpected response: ".$e->innards_as_xml);
+};
+$fc->push_c2s($iq);
 
 package FakeCon;
 
