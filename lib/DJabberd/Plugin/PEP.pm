@@ -819,9 +819,7 @@ sub publish {
     # All explicit subscriptions
     my $pub = $self->get_pub($user,$node);
     # Now walk through known subscribers
-    foreach my$bare(keys(%{$pub})) {
-	# FIXME: we probably shouldn't expose it here, hard to track
-	next if($bare eq '@last@' || $bare eq '@cfg@');
+    foreach my$bare(get_pub_nodes($pub)) {
 	foreach my$full(keys(%{$pub->{$bare}})) {
 	    next unless($pub->{$bare}->{$full}); # Negative subscription - filtered out
 	    $self->emit($event,$full);
@@ -958,7 +956,7 @@ sub subscribe {
     my $self = shift;
     my DJabberd::JID $user = shift;
     # Subsription attempt, may come from either presence event (auto) or explicit subscription request
-    $logger->debug("Subscribing user ".$user->as_string." to ".join(', ',@{$self->get_sub($user)->{topics}}));
+    $logger->debug("Subscribing user ".$user->as_string." to ".join(', ', $self->get_sub_nodes($user)));
     # Assuming prsence event - so iterate through roster and find all publishers with both/from presence
     my @pubs = $self->get_subpub($user->as_bare_string);
     # Also check XEP-0060 9.1.2 auto-sub presence-sharer case
@@ -1167,9 +1165,8 @@ Returns array of strings representing pubsub nodeID (namespaces)
 =cut
 
 sub get_pub_nodes {
-    my $self = shift;
-    my $user = shift;
-    my $pub = $self->get_pub($user);
+    my ($self, $user) = @_;
+    my $pub = ref($self) eq 'HASH' ? $self : $self->get_pub($user);
     return () unless($pub && ref($pub) eq 'HASH');
     return grep{$_ && $_ ne '@last@' && $_ ne '@cfg@' && ref($pub->{$_})} keys(%{$pub});
 }
