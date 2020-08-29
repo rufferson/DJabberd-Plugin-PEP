@@ -225,11 +225,7 @@ sub register {
 	if($disco eq 'info' && $ri && ref($ri) && $ri->subscription->{from}) {
 	    return $cb->addFeatures(['pubsub','pep'],map{PUBSUBNS."#$_"}@pubsub_features);
 	} elsif($disco eq 'items') {
-	    if($ri && ref($ri) && $ri->subscription->{from}) {
-		return $cb->addItems(map{[$bare->as_bare_string,$_]}$self->get_pub_nodes($bare->as_bare_string));
-	    } else {
-		# TODO: list explicit subscriptions for $from
-	    }
+	    return $cb->addItems(map{[$bare->as_bare_string,$_]}grep{$self->check_perms($from,$bare,$_)}$self->get_pub_nodes($bare));
 	}
 	$cb->decline;
     });
@@ -651,11 +647,9 @@ sub get_pep($$$) {
 }
 
 sub check_perms {
-    my $self = shift;
-    my $from = shift;
-    my $user = shift;
-    my $node = shift;
+    my ($self, $from, $user, $node) = @_;
     # Check implied (own resource) subscription
+    $logger->debug("Checking permissions for $from to $node on $user");
     return 1 if($from->as_bare_string eq $user->as_bare_string);
     if ($node) {
 	my $pub = $self->get_pub($user,$node);

@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 use strict;
-use Test::More tests => 14;
+use Test::More tests => 23;
 
 use DJabberd;
 DJabberd::Log::set_logger("main");
@@ -269,15 +269,49 @@ $dtest = sub {
     fail("Unexpected response: ".$e->innards_as_xml);
 };
 $fc->push_c2s($iq);
+$iq->remove_child($psq);
+
+##
+# We have now some nodes with all different pams, let's re-disco'm all to check permissions
+my $dsq = DJabberd::XMLElement->new('http://jabber.org/protocol/disco#items', 'query', {xmlns=>'http://jabber.org/protocol/disco#items'}, []);
+$iq->push_child($dsq);
+$iq->set_attr('{}type'=>'get');
+$iq->set_from("$her/blah");
+$wtest = sub {
+    my ($e) = @_;
+    $res_ok->($e);
+    like($e, qr{node=['"]urn:xmpp:omemo:1:devices["']}, "Has node devices") or diag($e);
+    like($e, qr{node=['"]storage:bookmarks["']}, "Has node bookmarks") or diag($e);
+    like($e, qr{node=['"]urn:xmpp:avatar:metadata["']}, "Has node metadata") or diag($e);
+};
+$dtest = sub {
+    my ($e) = @_;
+    ok($e->type eq 'result' && $e->innards_as_xml, 'Has results') or diag($e->as_xml);
+    like($e->innards_as_xml, qr{node=['"]urn:xmpp:omemo:1:devices["']}, "Has node devices") or diag($e->innards_as_xml);
+    like($e->innards_as_xml, qr{node=['"]urn:xmpp:avatar:metadata["']}, "Has node metadata") or diag($e->innards_as_xml);
+    fail('Has node bookamrks: '.$e->innards_as_xml) if($e->innards_as_xml =~ qr{node=['"]storage:bookmarks["']});
+};
+$fc->push_c2s($iq);
+$fc->{srv} = 1;
+$fc->push_s2s($iq);
+$iq->set_from("a\@b/c");
+$dtest = sub {
+    my ($e) = @_;
+    ok($e->type eq 'result' && $e->innards_as_xml, 'Has results') or diag($e->as_xml);
+    like($e->innards_as_xml, qr{node=['"]urn:xmpp:omemo:1:devices["']}, "Has node devices") or diag($e->innards_as_xml);
+    fail('Has node bookamrks: '.$e->innards_as_xml) if($e->innards_as_xml =~ qr{node=['"]storage:bookmarks["']});
+    fail('Has node metadata: '.$e->innards_as_xml) if($e->innards_as_xml =~ qr{node=['"]urn:xmpp:avatar:metadata["']});
+};
+$fc->push_s2s($iq);
 
 package FakeCon;
 
 sub new {
     bless { vh=>$_[1], jid=>$_[2], wr=>$_[3], sr=>$_[4], ss=>$_[5],
-	xl=>DJabberd::Log->get_logger('FakeCon::XML'), in_stream => 1}, $_[0];
+	xl=>DJabberd::Log->get_logger('FakeCon::XML'), in_stream => 1, srv => 0}, $_[0];
 }
 
-sub is_server { 0 }
+sub is_server { $_[0]->{srv} }
 sub is_available { 1 }
 sub vhost { $_[0]->{vh} }
 sub bound_jid { $_[0]->{jid} }
