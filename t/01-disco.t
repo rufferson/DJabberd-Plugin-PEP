@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 use strict;
-use Test::More tests => 6;
+use Test::More tests => 10;
 
 use DJabberd;
 DJabberd::Log::set_logger("main");

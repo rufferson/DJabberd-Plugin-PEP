@@ -60,6 +60,15 @@ See L<PERSISTENCE> for notes on non-volatile last-published implementation.
 
 =cut
 
+our @sub_features = (
+	'auto-subscribe',
+	'last-published',
+	'retrieve-items',
+	'access-presence',
+	'presence-subscribe',
+	'presence-notifications',
+	'filtered-notifications',
+);
 our @pubsub_features = (
 	'publish',
 	'auto-create',
@@ -222,8 +231,12 @@ sub register {
     }
     $vhost->register_hook("DiscoBare", sub {
 	my ($vh,$cb,$iq,$disco,$bare,$from,$ri) = @_;
-	if($disco eq 'info' && $ri && ref($ri) && $ri->subscription->{from}) {
-	    return $cb->addFeatures(['pubsub','pep'],map{PUBSUBNS."#$_"}@pubsub_features);
+	if($disco eq 'info') {
+	    if($ri && ref($ri) && $ri->subscription->sub_from) {
+		return $cb->addFeatures(['pubsub','pep'],map{PUBSUBNS."#$_"}@pubsub_features);
+	    } else {
+		return $cb->addFeatures(['pubsub','pep'],map{PUBSUBNS."#$_"}@sub_features);
+	    }
 	} elsif($disco eq 'items') {
 	    return $cb->addItems(map{[$bare->as_bare_string,$_]}grep{$self->check_perms($from,$bare,$_)}$self->get_pub_nodes($bare));
 	}
