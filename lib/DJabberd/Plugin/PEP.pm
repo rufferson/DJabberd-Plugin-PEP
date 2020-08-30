@@ -182,10 +182,18 @@ sub register {
     my $cleanup_cb = sub {
 	my ($vh, $cb, $c) = @_;
 	return $self unless($vh);
+	my $user;
 	if($c && $c->isa('DJabberd::Connection::ClientIn') && $c->bound_jid) {
-	    $self->del_subpub($c->bound_jid);
+	    $user = $c->bound_jid;
 	} elsif($c && $c->isa('DJabberd::Presence') && $c->from && !$c->from_jid->is_bare && !$c->is_directed) {
-	    $self->del_subpub($c->from_jid);
+	    $user = $c->from_jid;
+	}
+	if($user) {
+	    $self->del_subpub($user);
+	    # And remove own subs
+	    for my $node($self->get_pub_nodes($user)) {
+		$self->del_pub($user,$node,$user);
+	    }
 	}
 	$cb->decline;
     };
@@ -820,16 +828,6 @@ sub publish {
     $self->set_pub_last($item);
     # Prepare headline event message
     my $event = wrap_item($node, $item, 'headline');
-    # All user's resources are implicitly subscribed to own pub node (as to own presence)
-    foreach my$con($self->vh->find_conns_of_bare($user)) {
-	my $sub = $self->get_sub($con->bound_jid);
-	if(ref($sub) eq 'HASH' && ref($sub->{topics}) eq 'ARRAY') {
-	    $self->emit($event,$con->bound_jid)
-		if(grep{$_ eq $node}@{$sub->{topics}});
-	} elsif($self->{sub_mode} eq 'loose') {
-	    $self->emit($event,$con->bound_jid);
-	}
-    }
     # All explicit subscriptions
     my $pub = $self->get_pub($user,$node);
     # Now walk through known subscribers
@@ -837,6 +835,28 @@ sub publish {
 	foreach my$full(keys(%{$pub->{$bare}})) {
 	    next unless($pub->{$bare}->{$full}); # Negative subscription - filtered out
 	    $self->emit($event,$full);
+	}
+    }
+    # All user's resources are implicitly subscribed to own pub node (as to own
+    # presence) so if we are not yet subscribed let's do that here
+    foreach my$con($self->vh->find_conns_of_bare($user)) {
+	next if(defined $self->get_pub($user,$node,$user));
+	my $sub = $self->get_sub($con->bound_jid);
+	if(ref($sub) eq 'HASH' && ref($sub->{topics}) eq 'ARRAY') {
+	    if(grep{$_ eq $node}@{$sub->{topics}}) {
+		$logger->debug("Subscribing $user to own node $node");
+		$self->set_pub($user,$node,$user->as_bare_string,$user->as_string,1);
+		$self->emit($event,$con->bound_jid)
+	    } else {
+		$logger->debug("Suppressing $user from own node $node");
+		$self->set_pub($user,$node,$user->as_bare_string,$user->as_string,0);
+	    }
+	} elsif($self->{sub_mode} eq 'loose') {
+	    $logger->debug("Subscribing $user to own node $node");
+	    $self->set_pub($user,$node,$user->as_bare_string,$user->as_string,1);
+	    $self->emit($event,$con->bound_jid);
+	} else {
+	    $logger->debug("Ignoring $node for $user on own node");
 	}
     }
     my $cfg = $self->get_pub_cfg($user, $node);
@@ -943,7 +963,7 @@ sub unsubscribe {
 
 sub subscribe_for {
     my ($self, $user, $bpub, $new, $old) = @_;
-    if(ref $new) {
+    if(ref $new eq 'ARRAY') {
 	# Let's walk through user's interest list and subscribe to matching nodes
 	foreach my$t(@$new) {
 	    $self->subscribe_to($bpub,$t,$user);
@@ -987,6 +1007,8 @@ sub subscribe {
     my @pubs = $self->get_subpub($user->as_bare_string);
     # Also check XEP-0060 9.1.2 auto-sub presence-sharer case
     push(@pubs,keys(%{{$self->get_temp_sub($user)}}));
+    # Also refresh own subscriptions
+    push(@pubs,$user->as_bare_jid) if($self->vh->handles_jid($user));
     return unless(@pubs); # no established or pending subscriptions
     my $sub = $self->get_sub($user);
     return if($sub && $sub->{node} && !@{$sub->{topics}}); # We don't need no notifications
