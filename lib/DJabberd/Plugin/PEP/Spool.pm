@@ -212,7 +212,9 @@ sub node_dname {
 }
 sub item_fname {
     my ($self, $item, $jid, $nid, $iid) = @_;
-    my $user = MIME::Base64::encode_base64url(($item ? $item->{user} : $jid)->as_bare_string);
+    $jid = $item->{user} if(ref($item));
+    $jid = $jid->as_bare_string if(ref($jid));
+    my $user = MIME::Base64::encode_base64url($jid);
     my $node = MIME::Base64::encode_base64url(($item ? $item->{node} : $nid));
     my $id   = MIME::Base64::encode_base64url(($item ? $item->{id} : $iid));
     return $self->{spool}.'/'.$user.'/'.$node.'/'.$id;
