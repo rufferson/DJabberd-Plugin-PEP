@@ -99,7 +99,8 @@ use constant DEF_CFG => {
 # mode explicit | implicit | loose
 # explicit is not implemented yet
 # implicit is the default (auto-subscribe)
-# loose is the same except treat old 0115 presence as non-0115 - no disco, no filtering
+# loose is the same except treat old 0115 presence as non-0115 (no disco, no
+# filtering) and no presence means always send notifications (spammy)
 sub set_config_mode {
     $_[0]->{sub_mode} = $_[1];
 }
@@ -819,9 +820,15 @@ sub publish {
     $self->set_pub_last($item);
     # Prepare headline event message
     my $event = wrap_item($node, $item, 'headline');
-    # All user's resources are implicitly subscribed to all PEP events disregarding their capabilities.
+    # All user's resources are implicitly subscribed to own pub node (as to own presence)
     foreach my$con($self->vh->find_conns_of_bare($user)) {
-	$self->emit($event,$con->bound_jid);
+	my $sub = $self->get_sub($con->bound_jid);
+	if(ref($sub) eq 'HASH' && ref($sub->{topics}) eq 'ARRAY') {
+	    $self->emit($event,$con->bound_jid)
+		if(grep{$_ eq $node}@{$sub->{topics}});
+	} elsif($self->{sub_mode} eq 'loose') {
+	    $self->emit($event,$con->bound_jid);
+	}
     }
     # All explicit subscriptions
     my $pub = $self->get_pub($user,$node);
@@ -871,8 +878,20 @@ sub publish {
 	    }
 	    # If we have no presence cache - we're likely starting up, let's skip flooding till we get one
 	    next unless($self->get_sub);
-	    # No presence knowledge, push to the bare
-	    $self->emit($event,$ri->jid->as_string);
+	    # No presence cached, check it explicitly for local resources
+	    if($self->vh->handles_jid($ri->jid)) {
+		# actually, can't imagine a situation it would happen, may just skip whatsoever
+		$self->vh->check_presence($ri->jid, sub {
+		    my ($map) = @_;
+		    foreach my $full(keys %{$map}) {
+			# Not gonna handle this for now, but let's shout at least
+			warn("Presence cache miss for $full ".$map->{$full}->as_xml);
+		    }
+		});
+		next;
+	    }
+	    # External resource with no cached presence - emit if we are in a loose mode
+	    $self->emit($event,$ri->jid->as_string) if($self->{sub_mode} eq 'loose');
 	}
     }) if($cfg->{pam} eq 'presence' || $cfg->{pam} eq 'roster');
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 use strict;
-use Test::More tests => 23;
+use Test::More tests => 24;
 
 use DJabberd;
 DJabberd::Log::set_logger("main");
@@ -75,6 +75,8 @@ $vhost->register_hook("deliver", sub {
     $cb->delivered();
 }, 'DJabberd::Delivery::Local'); # Cheat to intercept S2S delivery
 
+#set own filtered notifications
+$pep->set_sub($fc->bound_jid, 'test#blah', 'urn:xmpp:omemo:1:devices+notify', 'urn:xmpp:avatar:metadata+notify', 'storage:bookmarks+notify');
 # Publish and create open-access node - should receive pep event on self
 # Prepare published data
 my $psp = DJabberd::XMLElement->new(undef, 'publish', { '{}node' => 'urn:xmpp:omemo:1:devices' }, []);
@@ -179,6 +181,16 @@ $dtest = sub {
 $stest = $pepevt;
 $fc->push_c2s($iq);
 $item->remove_child($ava_mdx);
+
+# Now lets make similar but the one we're not willing to get (no +notify)
+my $ava_ddx = DJabberd::XMLElement->new('urn:xmpp:avatar:data','data',{xmlns=>'urn:xmpp:avatar:data'},[],$ava_b64);
+$item->push_child($ava_ddx);
+$psp->set_attr('{}node' => 'urn:xmpp:avatar:data');
+# and make sure we don't get anything
+$stest = sub { fail(@_) };
+$fc->push_c2s($iq);
+$item->remove_child($ava_ddx);
+
 
 # Let's send directed presence again and make sure we still don't have event
 # ignore sent presence
