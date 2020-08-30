@@ -1008,7 +1008,7 @@ sub subscribe {
     # Also check XEP-0060 9.1.2 auto-sub presence-sharer case
     push(@pubs,keys(%{{$self->get_temp_sub($user)}}));
     # Also refresh own subscriptions
-    push(@pubs,$user->as_bare_jid) if($self->vh->handles_jid($user));
+    push(@pubs,$user->as_bare_string) if($self->vh->handles_jid($user));
     return unless(@pubs); # no established or pending subscriptions
     my $sub = $self->get_sub($user);
     return if($sub && $sub->{node} && !@{$sub->{topics}}); # We don't need no notifications
