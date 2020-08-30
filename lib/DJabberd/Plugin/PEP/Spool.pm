@@ -188,12 +188,13 @@ sub set_pub_cfg {
 }
 
 sub del_pub {
-    my ($self, $user, $node) = @_;
-    $self->SUPER::del_pub($user, $node);
-    # and clear the storage now
-    my $dnode = $self->node_dname($user, $node);
-    File::Path::remove_tree($dnode) or
-	$DJabberd::Plugin::PEP::logger->debug("Cannot remove node spool dir: $!");
+    my ($self, $user, $node, $sub) = @_;
+    $self->SUPER::del_pub($user, $node, $sub);
+    unless($sub) {
+	# and clear the storage now
+	File::Path::remove_tree($self->node_dname($user, $node)) or
+	    $DJabberd::Plugin::PEP::logger->debug("Cannot remove node spool dir: $!");
+    }
 }
 
 ##
