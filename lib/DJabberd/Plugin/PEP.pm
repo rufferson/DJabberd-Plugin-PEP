@@ -86,13 +86,13 @@ our @pubsub_features = (
 );
 
 use constant DEF_CFG => {
-    pam => 'presence',
-    max => 1,
-    deliver_notifications => 1,
-    last => 'on_sub_and_presence',
-    persist_items => 0,
-    notification_type => 'headline',
-    deliver_payloads => 1,
+    pam => 'presence',		    # implemented
+    max => 1,			    # implemented in Spool
+    deliver_notifications => 1,	    # implemented
+    last => 'on_sub_and_presence',  # implemented
+    persist_items => 0,		    # implemented in Spool
+    notification_type => 'headline',# implemented
+    deliver_payloads => 1,	    # implemented
 };
 
 ##
@@ -800,7 +800,7 @@ The Event (DJabberd::Message object) is stored as last event - to be delivered t
 =cut
 
 sub wrap_item {
-    my ($node, $item, $type, $delay) = @_;
+    my ($node, $item, $type, $delay, $no_data) = @_;
     Carp::confess("wrong input: $item") unless(!$item || ref $item eq 'HASH' || ref $item eq 'ARRAY');
     my $items = DJabberd::XMLElement->new(undef,'items',{'{}node'=>$node}, []);
     if(ref $item eq 'HASH') {
@@ -808,7 +808,7 @@ sub wrap_item {
     } elsif(ref $item eq 'ARRAY') {
 	for my$i(@{ $item }) {
 	    next unless($i); # We may have undef returned and pushed to the array
-	    $items->push_child(DJabberd::XMLElement->new(undef, 'item', {'{}id'=>$i->{id}},[],$i->{data}));
+	    $items->push_child(DJabberd::XMLElement->new(undef, 'item', {'{}id'=>$i->{id}},[],($no_data ? undef : $i->{data})));
 	}
     }
     return $items unless($type);
@@ -844,8 +844,11 @@ sub publish {
     $item->{id} ||= Digest::SHA::sha256_base64($item->{data});
     # And store for later use (new contacts)
     $self->set_pub_last($item);
-    # Prepare headline event message
-    my $event = wrap_item($node, $item, 'headline');
+    my $cfg = $self->get_pub_cfg($user, $node);
+    # If notifications are disabled - we're done here
+    return unless($cfg->{deliver_notifications});
+    # Prepare event message according to the node configuration
+    my $event = wrap_item($node, $item, $cfg->{notification_type}, 0, !$cfg->{deliver_payloads});
     # All explicit subscriptions
     my $pub = $self->get_pub($user,$node);
     # Now walk through known subscribers
@@ -877,7 +880,6 @@ sub publish {
 	    $logger->debug("Ignoring $node for $user on own node");
 	}
     }
-    my $cfg = $self->get_pub_cfg($user, $node);
     # Then try to figure something from Roster and Subs if Access Model is roster based
     $self->vh->get_roster($user,on_success=>sub {
 	my $roster = shift;
@@ -946,8 +948,11 @@ sub subscribe_to {
     return if($self->get_pub($pubj,$node,$user)); # already subscribed here
     # Flag the full jid under bare as active for node of pubj
     $self->set_pub($pubj,$node,$user->as_bare_string,$user->as_string,1);
-    # Once subscribed - last event should be pushed.
-    $self->emit(wrap_item($node,$self->get_pub_last($pubj,$node,,1),'headline',1),$user);
+    my $cfg = $self->get_pub_cfg($pubj, $node);
+    if($cfg->{deliver_notifications} && ($cfg->{last} eq 'on_sub' or $cfg->{last} eq 'on_sub_and_presence')) {
+	# Once subscribed - last event should be pushed according to the node configuration.
+	$self->emit(wrap_item($node,$self->get_pub_last($pubj,$node,,1),$cfg->{notification_type},1,!($cfg->{deliver_payloads})),$user);
+    }
 }
 
 =head2 unsubscribe($self, $bpub, $bsub)
