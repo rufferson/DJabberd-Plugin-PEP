@@ -495,10 +495,14 @@ sub parse_conf {
 	}
     };
     my $o = {};
+    my $e = [];
     for my $field (@fields) {
-	$o->{ $fn->($field,1) } = (ref($field) eq 'ARRAY' ? [ $fo->value( $fn->($field) ) ] : [ $fo->value($fn->($field)) ]->[0]) if($fo->value($fn->($field)));
+	if($fo->value($fn->($field))) {
+	    $o->{ $fn->($field,1) } = (ref($field) eq 'ARRAY' ? [ $fo->value( $fn->($field) ) ] : [ $fo->value($fn->($field)) ]->[0]);
+	    push(@$e, "Option '".$fn->($field)."' is not supported") unless(exists DEF_CFG()->{$fn->($field,1)});
+	}
     }
-    return $o;
+    return (@$e ? [$o, $e] : $o);
 }
 
 =head2 set_pep($self,$iq)
@@ -548,6 +552,13 @@ sub set_pep {
 	    if($frm->type eq 'submit') {
 		$logger->debug("Parsing config for form: ".$frm->as_xml);
 		my $cfg = $self->parse_conf($frm);
+		return $iq->send_reply('error', "<error type='cancel'>
+			<not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>
+			<text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'>
+			".join("\n",@{$cfg->[1]})."
+			</text>
+		    </error>")
+		    if(ref($cfg) eq 'ARRAY');
 		return $iq->send_error("<error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'></error>")
 		    unless($self->set_pub_cfg($jid, $node, $cfg));
 	    }
@@ -570,6 +581,13 @@ sub set_pep {
 	    my $o = $self->parse_conf($frm);
 	    return $iq->send_reply('error', "<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>")
 		unless($o);
+	    return $iq->send_reply('error', "<error type='cancel'>
+			<not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>
+			<text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'>
+			".join("\n",@{$o->[1]})."
+			</text>
+		    </error>")
+		if(ref($o) eq 'ARRAY');
 	    $logger->debug("Processing publish-options on node $node for $jid");
 	    my $cfg = $self->get_pub_cfg($jid, $node);
 	    if(ref $cfg) {

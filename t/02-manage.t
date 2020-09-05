@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 use strict;
-use Test::More tests => 21;
+use Test::More tests => 22;
 
 use DJabberd;
 DJabberd::Log::set_logger("main");
@@ -215,6 +215,15 @@ $fc->push_c2s($iq);
 
 my $node_cfg = $pep->get_pub_cfg($fc->bound_jid,$psp->attr('{}node'),1);
 ok($node_cfg->{pam} eq 'open' && $node_cfg->{max} == 10 && !exists $node_cfg->{persist_items}, "Config is applied and default field is stripped");
+
+# try to apply config with unsupported option
+$frm->{fields}{'pubsub#contact'}={value=>['hamlet@denmark.lit']};
+push(@{ $frm->{order} }, 'pubsub#contact');
+$cfg->remove_child($xfr);
+$xfr = $frm->as_element or diag($frm->as_xml);
+$cfg->push_child($xfr);
+$test = $err_ok;
+$fc->push_c2s($iq);
 
 package FakeCon;
 
